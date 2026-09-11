@@ -55,6 +55,7 @@
         filename_prefix: 'ComfyDroid',
         use_manual: false,           // 为 true 时忽略角色卡，使用 manual_functions
         manual_functions: '',        // 手动粘贴的 functions JSON 数组
+        inject_prompt: true,         // 为 true 时向用户消息注入“绘图工具可用”提示，压制预设对工具调用的干扰
     };
 
     if (!extensionSettings.comfy_droid) {
@@ -485,6 +486,36 @@
     }
 
     // ------------------------------------------------------------------
+    // 消息注入：压制预设/角色对绘图工具的干扰
+    // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
+    // ------------------------------------------------------------------
+    const DRAW_KEYWORDS = /画|绘|图|生成图|壁纸|封面|海报|头像|插画|image|draw|picture|avatar/i;
+    const INJECT_TEXT = '\n\n[系统] 你已接入 Comfy 绘图工具链（工具：comfy_generate_image）。本条消息疑似要求生成图片：请调用 comfy_generate_image 直接出图，按你的角色风格撰写英文正向提示词；除非用户明确要求写故事，否则不要把它当作写作任务，不要用文字描述代替出图。';
+
+    function injectDrawingHint(msgText) {
+        if (!settings.inject_prompt) return msgText;
+        if (!msgText || !DRAW_KEYWORDS.test(msgText)) return msgText;
+        return msgText + INJECT_TEXT;
+    }
+
+    function setupMessageInjection() {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.setMessageFormatting !== 'function') {
+            console.warn('[ComfyDroid] 当前环境不支持 setMessageFormatting，消息注入不可用');
+            return;
+        }
+        try {
+            ctx.setMessageFormatting((chat, msgText, isUser) => {
+                if (!isUser) return msgText;
+                return injectDrawingHint(msgText);
+            });
+            console.log('[ComfyDroid] 消息注入已启用（绘图关键词触发）');
+        } catch (e) {
+            console.error('[ComfyDroid] 消息注入设置失败：', e);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 设置面板 UI（注入扩展设置区）
     // ------------------------------------------------------------------
     function renderSettings() {
@@ -499,6 +530,9 @@
               <small>角色卡 functions 字段中定义的三个工具会自动注册。在此填写 Comfy 服务连接参数。</small>
               <label class="checkbox_label" for="cd_use_manual">
                 <input type="checkbox" id="cd_use_manual"> 使用手动函数定义（忽略角色卡 functions）
+              </label>
+              <label class="checkbox_label" for="cd_inject">
+                <input type="checkbox" id="cd_inject"> 自动注入绘图提示（压制预设干扰，推荐开启）
               </label>
               <div style="margin-top:8px;">
                 <label for="cd_endpoint">Comfy 服务地址（含协议，如 https://xxx.trycloudflare.com）</label>
@@ -547,6 +581,8 @@
         setVal('cd_manual', settings.manual_functions);
         const useManualEl = document.getElementById('cd_use_manual');
         if (useManualEl) useManualEl.checked = !!settings.use_manual;
+        const injectEl = document.getElementById('cd_inject');
+        if (injectEl) injectEl.checked = !!settings.inject_prompt;
 
         // 绑定保存
         const bindSave = (id, key, coerce) => {
@@ -577,6 +613,12 @@
                 syncTools();
             });
         }
+        if (injectEl) {
+            injectEl.addEventListener('change', () => {
+                settings.inject_prompt = injectEl.checked;
+                saveSettingsDebounced();
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -601,6 +643,9 @@
 
         // 首次注册
         syncTools();
+
+        // 消息注入（压制预设干扰，强制绘图工具可用）
+        setupMessageInjection();
 
         // 切换角色 / 聊天时重新同步
         if (eventSource && eventTypes) {
