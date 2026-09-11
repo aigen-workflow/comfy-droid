@@ -1,0 +1,93 @@
+<html style="margin:0;padding:0;">
+<div style="background-color:transparent;box-sizing:border-box;font-family:'Roboto','PingFang SC','Segoe UI',Arial,sans-serif;--accent:#A3D5E8;color:#1A1B1C;font-size:13.5px;line-height:1.5;">
+  <div style="padding:2px 0 8px;">
+    <div style="font-size:15px;font-weight:600;margin-bottom:2px;">ComfyDroid 完整链路（示意）</div>
+    <div style="font-size:12px;color:#6B7280;margin-bottom:10px;">角色卡 functions → SillyTavern 动态注册 → LLM 函数调用 → 远程 ComfyUI 出图</div>
+
+    <!-- 第1步：用户输入 -->
+    <div style="display:flex;justify-content:center;">
+      <div style="flex:0 1 320px;min-width:0;padding:10px 14px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;text-align:center;">
+        <div style="font-weight:600;">梦客（用户）</div>
+        <div style="font-size:12px;color:#6B7280;">发送画面描述：主体 / 动作 / 构图 / 光影 / 画幅</div>
+      </div>
+    </div>
+    <div style="text-align:center;color:#9AA0A6;font-size:14px;line-height:1.4;">↓</div>
+
+    <!-- 第2步：SillyTavern 注册层 -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:stretch;">
+      <div style="flex:1 1 260px;min-width:0;padding:10px 14px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;">
+        <div style="font-weight:600;">角色卡 functions 字段</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">Comfy_Droid.json 顶层，3 个函数定义：</div>
+        <div style="font-size:12px;margin-top:6px;">
+          <div style="padding:3px 8px;background:rgba(163,213,232,0.18);border-radius:8px;margin-top:4px;">llm_generate_full_comfy_workflow</div>
+          <div style="padding:3px 8px;background:rgba(163,213,232,0.18);border-radius:8px;margin-top:4px;">comfy_submit_workflow</div>
+          <div style="padding:3px 8px;background:rgba(163,213,232,0.18);border-radius:8px;margin-top:4px;">comfy_check_progress</div>
+        </div>
+      </div>
+      <div style="align-self:center;color:#9AA0A6;font-size:16px;">→</div>
+      <div style="flex:1 1 260px;min-width:0;padding:10px 14px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;">
+        <div style="font-weight:600;">ComfyDroid 扩展</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">读取角色卡 → 逐个执行：</div>
+        <div style="font-size:12px;margin-top:6px;">
+          <div style="padding:3px 8px;background:rgba(163,213,232,0.18);border-radius:8px;margin-top:4px;">registerFunctionTool() ×3 真实注册</div>
+          <div style="padding:3px 8px;background:rgba(163,213,232,0.18);border-radius:8px;margin-top:4px;">CHAT_CHANGED 换卡自动重注册</div>
+        </div>
+      </div>
+    </div>
+    <div style="text-align:center;color:#9AA0A6;font-size:12px;line-height:1.6;margin-top:6px;">↓ tools 随请求注入</div>
+
+    <!-- 第3步：LLM 层 -->
+    <div style="display:flex;justify-content:center;">
+      <div style="flex:0 1 320px;min-width:0;padding:10px 14px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;text-align:center;">
+        <div style="font-weight:600;">LLM（DeepSeek / OpenAI 兼容 · Chat Completion）</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">读取 tools → 返回 function_call（需勾选 Enable function calling）</div>
+      </div>
+    </div>
+    <div style="text-align:center;color:#9AA0A6;font-size:14px;line-height:1.4;">↓ action 执行（fetch）</div>
+
+    <!-- 第4步：三函数调用链 -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:stretch;">
+      <div style="flex:1 1 200px;min-width:0;padding:10px 12px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;">
+        <div style="font-weight:600;font-size:12.5px;">① 生成工作流</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">SDXL 模板拼装<br>→ 工作流 JSON</div>
+      </div>
+      <div style="align-self:center;color:#9AA0A6;font-size:16px;">→</div>
+      <div style="flex:1 1 200px;min-width:0;padding:10px 12px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;">
+        <div style="font-weight:600;font-size:12.5px;">② 提交任务</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">POST /prompt<br>→ prompt_id</div>
+      </div>
+      <div style="align-self:center;color:#9AA0A6;font-size:16px;">→</div>
+      <div style="flex:1 1 200px;min-width:0;padding:10px 12px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;">
+        <div style="font-weight:600;font-size:12.5px;">③ 轮询出图</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">GET /history/{id}<br>可多轮，直到 done</div>
+      </div>
+    </div>
+    <div style="text-align:center;color:#9AA0A6;font-size:14px;line-height:1.4;">↓</div>
+
+    <!-- 第5步：远程 ComfyUI -->
+    <div style="display:flex;justify-content:center;">
+      <div style="flex:0 1 320px;min-width:0;padding:10px 14px;background:#FFFFFF;border:1px solid rgba(0,0,0,0.08);border-radius:12px;box-sizing:border-box;text-align:center;">
+        <div style="font-weight:600;">远程 ComfyUI</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">https://xxx.trycloudflare.com（或 127.0.0.1:8188）<br>/view?filename=... 返回图片</div>
+      </div>
+    </div>
+    <div style="text-align:center;color:#9AA0A6;font-size:14px;line-height:1.4;">↓</div>
+
+    <!-- 第6步：结果 -->
+    <div style="display:flex;justify-content:center;">
+      <div style="flex:0 1 320px;min-width:0;padding:10px 14px;background:linear-gradient(135deg, rgba(82,196,26,0.10), rgba(82,196,26,0.18));border:1px solid rgba(82,196,26,0.35);border-radius:12px;box-sizing:border-box;text-align:center;">
+        <div style="font-weight:600;color:#3D8B1E;">出图完成</div>
+        <div style="font-size:12px;color:#6B7280;margin-top:4px;">聊天界面直接显示 ![image](url)</div>
+      </div>
+    </div>
+
+    <!-- 图例 -->
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid rgba(0,0,0,0.08);font-size:12px;color:#6B7280;">
+      <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:rgba(163,213,232,0.5);border:1px solid rgba(163,213,232,0.9);margin-right:4px;"></span>SillyTavern 侧组件</span>
+      <span><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#52C41A;margin-right:4px;"></span>链路终点（成功）</span>
+      <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:rgba(0,0,0,0.06);border:1px solid rgba(0,0,0,0.12);margin-right:4px;"></span>调用链节点</span>
+      <span>图为例示结构，函数名与 HTTP 动作以 README 为准</span>
+    </div>
+  </div>
+</div>
+</html>
