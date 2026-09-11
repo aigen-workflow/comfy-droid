@@ -75,11 +75,28 @@
     // 最近一次生成的工作流 JSON（供 submit 缺省参数时兜底使用）
     let lastWorkflowJson = '';
 
-    // 只把这三个已知函数注册为真实工具，其余函数名忽略
-    const SUPPORTED_TOOLS = ['llm_generate_full_comfy_workflow', 'comfy_submit_workflow', 'comfy_check_progress'];
+    // 只把这四个已知函数注册为真实工具，其余函数名忽略
+    const SUPPORTED_TOOLS = ['comfy_generate_image', 'llm_generate_full_comfy_workflow', 'comfy_submit_workflow', 'comfy_check_progress'];
 
-    // 内置默认三函数定义：角色卡读不到 functions 时兜底使用
+    // 内置默认函数定义：角色卡读不到 functions 时兜底使用
     const DEFAULT_FUNCTIONS = [
+        {
+            name: 'comfy_generate_image',
+            displayName: '生成图片',
+            description: '一站式绘图函数：根据画面描述直接生成图片并返回图片链接，自动完成“生成工作流→提交Comfy→轮询出图”全部流程，只需一次调用。当用户要求画/生成/绘制任何图片时，必须调用本函数（建议按当前角色的风格与视角撰写英文正向提示词）。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    positive: { type: 'string', description: '正向提示词，英文为主，写实风格，细节丰富（可融入当前角色的描写风格）' },
+                    negative: { type: 'string', description: '反向负面提示词，畸形、水印、低画质等' },
+                    width: { type: 'integer', description: '图片宽度，默认896' },
+                    height: { type: 'integer', description: '图片高度，默认1152' },
+                    steps: { type: 'integer', description: '采样步数，默认28' },
+                    cfg: { type: 'number', description: 'CFG参数，默认7' },
+                },
+                required: ['positive'],
+            },
+        },
         {
             name: 'llm_generate_full_comfy_workflow',
             displayName: '生成ComfyUI工作流',
@@ -325,12 +342,76 @@
     }
 
     // ------------------------------------------------------------------
+    // 一站式绘图：生成工作流 + 提交 + 轮询出图，一次调用完成
+    // ------------------------------------------------------------------
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function actionGenerateImage(args) {
+        const a = args || {};
+        if (!settings.comfy_endpoint) {
+            return JSON.stringify({ error: '未配置 Comfy 服务地址，请在扩展设置中填写' });
+        }
+        if (!settings.checkpoint) {
+            return JSON.stringify({ error: '未配置 checkpoint 模型名，请在扩展设置中填写' });
+        }
+        const positive = a.positive || '';
+        if (!String(positive).trim()) {
+            return JSON.stringify({ error: '缺少正向提示词 positive' });
+        }
+
+        // 1) 生成工作流（内部会保存 lastWorkflowJson）
+        const json = await actionBuildWorkflow(a);
+        let workflow;
+        try {
+            workflow = JSON.parse(json);
+        } catch (e) {
+            return json;
+        }
+
+        // 2) 提交
+        const submitRaw = await actionSubmitWorkflow({ workflow_json: json });
+        let sub;
+        try {
+            sub = JSON.parse(submitRaw);
+        } catch (e) {
+            return JSON.stringify({ error: '提交响应解析失败：' + submitRaw });
+        }
+        const pid = sub && sub.prompt_id;
+        if (!pid) {
+            return JSON.stringify({ error: '提交失败：' + (sub.error || submitRaw) });
+        }
+
+        // 3) 轮询出图（最长 120 秒，每 2 秒一次）
+        for (let i = 0; i < 60; i++) {
+            await sleep(2000);
+            let res;
+            try {
+                res = JSON.parse(await actionCheckProgress({ prompt_id: pid }));
+            } catch (e) {
+                continue;
+            }
+            if (res.status === 'done') {
+                return JSON.stringify(res);
+            }
+            if (res.status === 'error') {
+                return JSON.stringify(res);
+            }
+        }
+        return JSON.stringify({ status: 'timeout', prompt_id: pid, message: '轮询超时（120秒），可调用 comfy_check_progress 继续查询' });
+    }
+
+    // ------------------------------------------------------------------
     // 把角色卡函数描述转换成 ST 工具定义
     // ------------------------------------------------------------------
     function makeTool(fn) {
         const name = fn.name;
         let action;
         switch (name) {
+            case 'comfy_generate_image':
+                action = actionGenerateImage;
+                break;
             case 'llm_generate_full_comfy_workflow':
                 action = actionBuildWorkflow;
                 break;
