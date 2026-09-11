@@ -72,6 +72,8 @@
 
     // 供 check_progress 兜底使用的最近一次 prompt_id
     let lastPromptId = '';
+    // 最近一次生成的工作流 JSON（供 submit 缺省参数时兜底使用）
+    let lastWorkflowJson = '';
 
     // 只把这三个已知函数注册为真实工具，其余函数名忽略
     const SUPPORTED_TOOLS = ['llm_generate_full_comfy_workflow', 'comfy_submit_workflow', 'comfy_check_progress'];
@@ -81,7 +83,7 @@
         {
             name: 'llm_generate_full_comfy_workflow',
             displayName: '生成ComfyUI工作流',
-            description: '根据用户的画面提示词，生成完整可直接运行的ComfyUI工作流JSON（正向提示词、反向负面词、尺寸、步数、CFG）。',
+            description: '根据用户的画面提示词生成 ComfyUI 工作流（正向提示词、反向负面词、尺寸、步数、CFG）。调用后请紧接着调用 comfy_submit_workflow 提交（无需再传工作流内容，扩展会自动使用刚生成的工作流）。',
             parameters: {
                 type: 'object',
                 properties: {
@@ -98,13 +100,12 @@
         {
             name: 'comfy_submit_workflow',
             displayName: '提交工作流到Comfy',
-            description: '将生成好的ComfyUI工作流JSON提交到远程Comfy服务器API，返回prompt_id。',
+            description: '将 ComfyUI 工作流提交到远程 Comfy 服务器 API，返回 prompt_id。workflow_json 参数可省略：省略时自动提交扩展内刚生成的工作流（推荐直接省略，避免超长 JSON 截断）。',
             parameters: {
                 type: 'object',
                 properties: {
-                    workflow_json: { type: 'string', description: '完整comfy工作流json字符串' },
+                    workflow_json: { type: 'string', description: '（可选）完整 comfy 工作流 json 字符串；不传则自动使用刚生成的工作流' },
                 },
-                required: ['workflow_json'],
             },
         },
         {
@@ -213,7 +214,9 @@
                 inputs: { filename_prefix: settings.filename_prefix, images: ['8', 0] },
             },
         };
-        return JSON.stringify(workflow);
+        const json = JSON.stringify(workflow);
+        lastWorkflowJson = json; // 记住本次工作流，供 submit 缺省参数使用
+        return json;
     }
 
     // 2) 提交工作流到远程 ComfyUI
@@ -222,12 +225,17 @@
         if (!settings.comfy_endpoint) {
             return JSON.stringify({ error: '未配置 Comfy 服务地址，请在扩展设置中填写' });
         }
-        if (!a.workflow_json) {
-            return JSON.stringify({ error: '缺少 workflow_json 参数' });
+        let workflowJson = a.workflow_json;
+        // 未传或传空时，自动使用最近一次生成的工作流
+        if ((!workflowJson || !String(workflowJson).trim()) && lastWorkflowJson) {
+            workflowJson = lastWorkflowJson;
+        }
+        if (!workflowJson) {
+            return JSON.stringify({ error: '缺少 workflow_json 参数，且没有已生成的工作流可提交（请先调用 llm_generate_full_comfy_workflow）' });
         }
         let workflow;
         try {
-            workflow = JSON.parse(a.workflow_json);
+            workflow = JSON.parse(workflowJson);
         } catch (e) {
             return JSON.stringify({ error: 'workflow_json 不是合法 JSON：' + e.message });
         }
