@@ -76,6 +76,51 @@
     // 只把这三个已知函数注册为真实工具，其余函数名忽略
     const SUPPORTED_TOOLS = ['llm_generate_full_comfy_workflow', 'comfy_submit_workflow', 'comfy_check_progress'];
 
+    // 内置默认三函数定义：角色卡读不到 functions 时兜底使用
+    const DEFAULT_FUNCTIONS = [
+        {
+            name: 'llm_generate_full_comfy_workflow',
+            displayName: '生成ComfyUI工作流',
+            description: '根据用户的画面提示词，生成完整可直接运行的ComfyUI工作流JSON（正向提示词、反向负面词、尺寸、步数、CFG）。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    positive: { type: 'string', description: '正向提示词，英文为主，写实风格，细节丰富' },
+                    negative: { type: 'string', description: '反向负面提示词，畸形、水印、低画质等' },
+                    width: { type: 'integer', description: '图片宽度，默认896' },
+                    height: { type: 'integer', description: '图片高度，默认1152' },
+                    steps: { type: 'integer', description: '采样步数，默认28' },
+                    cfg: { type: 'number', description: 'CFG参数，默认7' },
+                },
+                required: ['positive', 'negative'],
+            },
+        },
+        {
+            name: 'comfy_submit_workflow',
+            displayName: '提交工作流到Comfy',
+            description: '将生成好的ComfyUI工作流JSON提交到远程Comfy服务器API，返回prompt_id。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    workflow_json: { type: 'string', description: '完整comfy工作流json字符串' },
+                },
+                required: ['workflow_json'],
+            },
+        },
+        {
+            name: 'comfy_check_progress',
+            displayName: '查询出图进度',
+            description: '查询ComfyUI绘图任务进度，任务完成后返回图片地址（markdown链接）。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    prompt_id: { type: 'string', description: '提交任务返回的prompt_id' },
+                },
+                required: ['prompt_id'],
+            },
+        },
+    ];
+
     // ------------------------------------------------------------------
     // 读取角色卡 functions
     // ------------------------------------------------------------------
@@ -95,13 +140,18 @@
             }
         }
         const char = getCurrentCharacter();
-        if (!char) return [];
-        const data = char.data || {};
-        let fns = data.functions;
-        if (!Array.isArray(fns) && data.extensions && Array.isArray(data.extensions.functions)) {
-            fns = data.extensions.functions;
+        let fns = [];
+        if (char) {
+            const data = char.data || {};
+            fns = data.functions;
+            if (!Array.isArray(fns) && data.extensions && Array.isArray(data.extensions.functions)) {
+                fns = data.extensions.functions;
+            }
         }
-        return Array.isArray(fns) ? fns : [];
+        if (Array.isArray(fns) && fns.length > 0) return fns;
+        // 兜底：角色卡未提供 functions 时，使用内置默认三函数定义
+        console.warn('[ComfyDroid] 角色卡未提供 functions，使用内置默认定义');
+        return JSON.parse(JSON.stringify(DEFAULT_FUNCTIONS));
     }
 
     // ------------------------------------------------------------------
