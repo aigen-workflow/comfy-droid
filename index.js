@@ -84,7 +84,7 @@
         {
             name: 'comfy_generate_image',
             displayName: '生成图片',
-            description: '一站式绘图函数：根据画面描述直接生成图片并返回图片链接，自动完成“生成工作流→提交Comfy→轮询出图”全部流程，只需一次调用。当用户要求画/生成/绘制任何图片时，必须调用本函数（建议按当前角色的风格与视角撰写英文正向提示词）。',
+            description: '一站式绘图函数：根据画面描述直接生成图片并返回图片链接，自动完成“生成工作流→提交Comfy→轮询出图”全部流程，只需一次调用。当用户要求画/生成/绘制任何图片时，必须调用本函数（建议按当前角色的风格与视角撰写英文正向提示词）。【强制】工具返回图片链接后，你必须在最终回复中用 ![image](图片链接) 的 markdown 格式把图片展示给用户；绝对禁止回复“没有新画面，未出图”或任何不包含图片链接的文字。',
             parameters: {
                 type: 'object',
                 properties: {
@@ -490,7 +490,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成图|壁纸|封面|海报|头像|插画|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[系统] 你已接入 Comfy 绘图工具链（工具：comfy_generate_image）。本条消息疑似要求生成图片：请调用 comfy_generate_image 直接出图，按你的角色风格撰写英文正向提示词；除非用户明确要求写故事，否则不要把它当作写作任务，不要用文字描述代替出图。';
+    const INJECT_TEXT = '\n\n[系统] 你已接入 Comfy 绘图工具链（工具：comfy_generate_image）。本条消息疑似要求生成图片：请调用 comfy_generate_image 直接出图，按你的角色风格撰写英文正向提示词；除非用户明确要求写故事，否则不要把它当作写作任务，不要用文字描述代替出图。工具返回图片链接后，必须在最终回复中用 ![image](图片链接) 把图片展示出来，绝对禁止回复“没有新画面，未出图”等不含图片链接的文字。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
