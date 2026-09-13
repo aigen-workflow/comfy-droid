@@ -647,8 +647,21 @@
                 res.quality_attempts = attempt;
                 return JSON.stringify(res);
             }
-            // FAIL：记录原因，换 seed 重试
+            // FAIL：优先尝试局部重绘（mask 定位到问题区域）；无 mask 或重绘失败 → 换 seed 整图重试
             gateFailures.push(String(summary));
+            const maskMatch = String(summary).match(/mask=(masks\/[^|]+)/);
+            if (maskMatch && res.images && res.images.length && settings.quality_inpaint !== false) {
+                const repaired = await tryInpaintRepair(res.images[0].url, maskMatch[1], a);
+                if (repaired && repaired.quality_gate && String(repaired.quality_gate).startsWith('PASS')) {
+                    repaired.quality_attempts = attempt;
+                    repaired.quality_repair = true;
+                    repaired.quality_gate_history = gateFailures.join(' || ');
+                    return JSON.stringify(repaired);
+                }
+                if (repaired && repaired.error) {
+                    gateFailures.push('inpaint:' + String(repaired.error).slice(0, 120));
+                }
+            }
             if (attempt < maxAttempts) {
                 continue;
             }
@@ -682,6 +695,103 @@
             return null;
         } catch (e) {
             return null;
+        }
+    }
+
+    // 局部重绘：把出图下载后上传到 Comfy input，用 mask 做 inpaint，复审 PASS 即交付
+    async function tryInpaintRepair(imageUrl, maskFile, args) {
+        const base = settings.comfy_endpoint.replace(/\/+$/, '');
+        try {
+            // 1) 下载出图 → 上传到 Comfy input（/upload/image 需开启 CORS）
+            const imgResp = await fetch(imageUrl);
+            const imgBlob = await imgResp.blob();
+            const srcName = 'qg_repair_' + Date.now() + '.png';
+            const fd = new FormData();
+            fd.append('image', imgBlob, srcName);
+            const upResp = await fetch(base + '/upload/image?overwrite=true', { method: 'POST', body: fd });
+            const upJson = await upResp.json();
+            const uploadedName = (upJson && upJson.name) || srcName;
+
+            // 2) 构造 inpaint 工作流：原图 + mask → VAEEncodeForInpaint → KSampler(denoise 0.6) → 复审
+            const positive = args.positive || '';
+            const negative = args.negative || '';
+            const wf = {
+                '1': { class_type: 'LoadImage', inputs: { image: uploadedName } },
+                '2': { class_type: 'LoadImage', inputs: { image: maskFile } },
+                '2b': { class_type: 'ImageToMask', inputs: { image: ['2', 0], channel: 'red' } },
+                '3': { class_type: 'VAEEncodeForInpaint', inputs: { pixels: ['1', 0], vae: ['4', 2], mask: ['2b', 0], grow_mask_by: 6 } },
+                '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: settings.checkpoint } },
+                '5': { class_type: 'KSampler', inputs: {
+                    seed: Math.floor(Math.random() * 1000000000000000),
+                    steps: Math.max(20, parseInt(settings.steps, 10) || 30),
+                    cfg: parseFloat(settings.cfg) || 6,
+                    sampler_name: settings.sampler_name || 'dpmpp_2m',
+                    scheduler: settings.scheduler || 'karras',
+                    denoise: 0.6,
+                    model: ['4', 0], positive: ['6', 0], negative: ['7', 0], latent_image: ['3', 0],
+                } },
+                '6': { class_type: 'CLIPTextEncode', inputs: { text: positive, clip: ['4', 1] } },
+                '7': { class_type: 'CLIPTextEncode', inputs: { text: negative, clip: ['4', 1] } },
+                '8': { class_type: 'VAEDecode', inputs: { samples: ['5', 0], vae: ['4', 2] } },
+                '9': { class_type: 'SaveImage', inputs: { filename_prefix: 'qg_inpaint', images: ['8', 0] } },
+            };
+            if (settings.quality_gate) {
+                wf['30'] = { class_type: 'QualityGate', inputs: { image: ['8', 0], expected_people: inferExpectedPeople(args), min_body_kp: 10, min_face_kp: 30 } };
+                wf['31'] = { class_type: 'SaveText', inputs: { text: ['30', 5], filename_prefix: 'qg_inpaint', format: 'txt' } };
+            }
+
+            // 3) 提交
+            const body = { prompt: wf, client_id: 'comfydroid-inpaint' };
+            const subResp = await fetch(base + '/prompt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const sub = await subResp.json();
+            if (!sub || !sub.prompt_id) {
+                return { error: (sub && sub.error) || '重绘提交失败' };
+            }
+            const pid = sub.prompt_id;
+
+            // 4) 轮询
+            let done = null;
+            for (let i = 0; i < 75; i++) {
+                await sleep(2000);
+                try {
+                    const hist = await (await fetch(base + '/history/' + encodeURIComponent(pid))).json();
+                    const entry = hist && hist[pid];
+                    if (!entry) continue;
+                    if (entry.status && entry.status.status_str === 'error') {
+                        return { error: '重绘执行出错' };
+                    }
+                    if (entry.status && entry.status.completed > 0) {
+                        const images = [];
+                        let summary = null;
+                        const outputs = entry.outputs || {};
+                        for (const nodeId of Object.keys(outputs)) {
+                            const out = outputs[nodeId];
+                            if (out && Array.isArray(out.images)) {
+                                for (const img of out.images) {
+                                    images.push({
+                                        url: base + '/view?filename=' + encodeURIComponent(img.filename)
+                                            + '&subfolder=' + encodeURIComponent(img.subfolder || '')
+                                            + '&type=' + encodeURIComponent(img.type || 'output'),
+                                        filename: img.filename,
+                                    });
+                                }
+                            }
+                            if (out && Array.isArray(out.text) && out.text.length) summary = String(out.text[0]);
+                        }
+                        done = { status: 'done', images: images, image_url: images[0] && images[0].url, quality_gate: summary };
+                        break;
+                    }
+                } catch (e) { /* 继续轮询 */ }
+            }
+            if (!done) return { error: '重绘轮询超时' };
+            if (done.image_url) done.markdown = '![image](' + done.image_url + ')';
+            return done;
+        } catch (e) {
+            return { error: '局部重绘失败：' + e.message };
         }
     }
 
