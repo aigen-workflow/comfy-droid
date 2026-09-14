@@ -747,11 +747,15 @@
             const armsMatch = String(summary).match(/arms=([0-9,;]+)/);
             const handsMatch = String(summary).match(/hands=([0-9,;]+)/);
             const maskMatch = String(summary).match(/mask=(masks\/[^|]+)/);
-            if ((boxesMatch || armsMatch || handsMatch) && res.images && res.images.length && settings.quality_inpaint !== false) {
+            // v5.8：无条件走审核重画——只要出图就尝试局部重绘（框为空则内部跳过），
+            // 不再依赖检测到修复框才触发，保证"所有图片都走审核重画路线"。
+            if (res.images && res.images.length && settings.quality_inpaint !== false) {
                 let repaired = null;
                 let curImage = res.images[0].url;
+                // PASS 图只重画手部（脸/臂无问题不动，避免过度修改）；FAIL 图全量修复
+                const qcPassed = String(summary).startsWith('PASS');
                 for (let rp = 0; rp < 3; rp++) {
-                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, armsMatch ? armsMatch[1] : null, handsMatch ? handsMatch[1] : null);
+                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, qcPassed ? null : (armsMatch ? armsMatch[1] : null), handsMatch ? handsMatch[1] : null);
                     if (!repaired) break;
                     if (repaired.error) {
                         gateFailures.push('inpaint:' + String(repaired.error).slice(0, 120));
