@@ -487,7 +487,7 @@
             },
             '4': {
                 class_type: 'CheckpointLoaderSimple',
-                inputs: { ckpt_name: settings.checkpoint },
+                inputs: { ckpt_name: useSdxl ? (settings.checkpoint_sdxl || settings.checkpoint) : settings.checkpoint },
             },
             '4a': useSdxl ? {
                 class_type: 'LoraLoader',
@@ -938,7 +938,7 @@
             const handPos = 'natural human hand, five fingers, well-proportioned fingers, detailed realistic hand, natural hand anatomy, fingers clearly separated, sharp focus, high quality';
             const wf = {
                 '1': { class_type: 'LoadImage', inputs: { image: uploadedName } },
-                '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: settings.checkpoint } },
+                '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: (settings.use_sdxl !== false) ? (settings.checkpoint_sdxl || settings.checkpoint) : settings.checkpoint } },
                 '6': { class_type: 'CLIPTextEncode', inputs: { text: facePos, clip: ['4', 1] } },
                 '6a': { class_type: 'CLIPTextEncode', inputs: { text: armPos, clip: ['4', 1] } },
                 '6b': { class_type: 'CLIPTextEncode', inputs: { text: handPos, clip: ['4', 1] } },
