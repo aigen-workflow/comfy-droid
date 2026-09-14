@@ -315,6 +315,23 @@
             if (expN === 1 && hasPerson) {
                 // 非姿势图才注入正面 solo 词（姿势图由骨架决定人数，注入 solo 会与骨架冲突）；
                 // 负面"多人"词始终注入
+                // v5.9 性别锁定（独立于 solo 注入；姿势图不锁以免与骨架冲突）。
+                // 中英文性别词都识别：中文无空格边界，用 includes 判断。
+                if (!poseFile) {
+                    const maleHits = /(^|[,\s])(man|boy|male|guy|gentleman|soldier)([,\s]|$)/i.test(positive) || /男人|男孩|男子|少年|帅哥|先生|王子|英雄/.test(positive);
+                    const femaleHits = /(^|[,\s])(woman|girl|female|lady|heroine|nun)([,\s]|$)/i.test(positive) || /女人|女孩|女子|少女|女生|美女|女士|公主|女神/.test(positive);
+                    if (maleHits && !femaleHits) {
+                        const sexPos = '1man, only one man, masculine male';
+                        if (!/(^|[,\s])(1man|one man)([,\s]|$)/i.test(positive)) positive = sexPos + ', ' + positive;
+                        const sexNeg = '1girl, 1woman, female, feminine, woman, girl, 女人, 女孩, 双性人, androgynous, hermaphrodite';
+                        negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                    } else if (femaleHits && !maleHits) {
+                        const sexPos = '1girl, only one woman, feminine female';
+                        if (!/(^|[,\s])(1girl|one girl|1woman|one woman)([,\s]|$)/i.test(positive)) positive = sexPos + ', ' + positive;
+                        const sexNeg = '1man, 1boy, male, masculine, man, boy, 男人, 男孩, 双性人, androgynous, hermaphrodite';
+                        negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                    }
+                }
                 if (!poseFile && !/(^|[,\s])(solo|single person|only one|alone)([,\s]|$)/i.test(positive)) {
                     let singleTag;
                     if (/(^|[,\s])(man|boy|male|guy|gentleman|soldier)([,\s]|$)/i.test(positive)) {
@@ -353,6 +370,17 @@
                 const extraNeg = 'person, people, figure, human, 人物, 人影';
                 negative = negative ? negative + ', ' + extraNeg : extraNeg;
             }
+        }
+
+        // ---- v5.9 肢体锁定（所有人物图）：正面约束解剖正确 + 负面排除多肢/缺肢 ----
+        // 配合 QualityGate 的 extra arms/legs 检测（FAIL→换 seed 重试），双保险防"多肢体/肢体变形"。
+        if (inferExpectedPeople() !== 0) {
+            const bodyPos = 'correct anatomy, natural body proportions, correct number of arms and legs, one head, two arms, two legs, well-proportioned limbs, intact limbs';
+            if (!/(correct anatomy|natural body proportions|well-proportioned)/i.test(positive)) {
+                positive = bodyPos + ', ' + positive;
+            }
+            const bodyNeg = 'extra arm, extra leg, extra hand, third arm, third leg, missing arm, missing leg, dislocated limb, merged limbs, fused limbs, deformed limbs, twisted limbs, broken anatomy, extra limbs, disfigured limbs';
+            negative = negative ? negative + ', ' + bodyNeg : bodyNeg;
         }
 
         // ---- 默认风格注入 ----
