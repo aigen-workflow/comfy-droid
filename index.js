@@ -317,6 +317,20 @@
                 // 双人场景：禁止第三人/额外人物（原逻辑只在非 pose 场景有双人词，pose 场景漏掉）
                 const extraNeg = 'third person, extra person, three people, group of people, additional figure';
                 negative = negative ? negative + ', ' + extraNeg : extraNeg;
+                // v5.4 新增性别锁定：截图证据——"夫妻跳舞"被模型自由发挥画成两位红裙女性相拥
+                // （模型受角色卡 eroticism 残留影响默认生成女性）。异性伴侣语义(夫妻/夫妇/情侣/男女/
+                // husband/wife 等)时强制前置 1man 1woman 正面词，并负面排除双女/双男。
+                const MALE_FEMALE_HINTS = ['夫妻', '夫妇', '情侣', '一男一女', '一对男女', '男女', '丈夫', '妻子', '老公', '老婆', '新郎', '新娘', 'husband', 'wife', 'bride', 'groom', 'man and a woman', 'woman and a man', 'man and woman', 'woman and man', 'married couple', 'heterosexual'];
+                const SAME_SEX_HINTS = ['2girls', 'two girls', 'two women', 'two ladies', 'two females', 'both women', 'both girls', 'lesbian', 'gay men', 'two men', 'two boys', '双女', '两个女人', '两个女孩', '两个女生', '两位女士', '两个男人', '两个男孩', '男男', '女女'];
+                const isMaleFemale = MALE_FEMALE_HINTS.some((k) => hay.includes(k)) && !SAME_SEX_HINTS.some((k) => hay.includes(k));
+                if (isMaleFemale) {
+                    // 正面未含明确男女对才注入（避免重复堆叠）
+                    if (!/(^|[,\s])(1man|one man)([,\s]|$)/i.test(positive) || !/(^|[,\s])(1woman|one woman)([,\s]|$)/i.test(positive)) {
+                        positive = '1man 1woman, ' + positive;
+                    }
+                    const sexNeg = '2girls, two women, both women, two females, lesbian couple, 双女, 两个女人';
+                    negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                }
             } else if (expN === 3) {
                 const extraNeg = 'fourth person, extra person, crowd, group of people';
                 negative = negative ? negative + ', ' + extraNeg : extraNeg;
