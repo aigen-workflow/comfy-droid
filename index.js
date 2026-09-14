@@ -382,6 +382,11 @@
             negative = negative ? negative + ', ' + bodyNeg : bodyNeg;
         }
 
+        // ---- v6.2 基础质量词兜底（所有图统一路线）：无论风格设置如何，缺质量词都补齐 ----
+        if (!/(masterpiece|best quality|highly detailed|ultra detailed|high quality)/i.test(positive)) {
+            positive = 'masterpiece, best quality, highly detailed, ' + positive;
+        }
+
         // ---- 默认风格注入 ----
         // 默认写实增强（realistic_enhance=true，越接近真实越好）；开启 comic_style 时改为漫画渲染。
         // 用户显式指定其他风格（anime/manga/cartoon/油画/水彩等）时不重复注入。
@@ -397,7 +402,8 @@
             const styleHay = (positive + ' ' + negative).toLowerCase();
             const hasStyle = STYLE_OVERRIDE.some((k) => styleHay.includes(k));
             if (!hasStyle) {
-                positive = 'photorealistic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, high quality, ' + positive;
+                // v6.2 专业写实术语库：质量+画风+光线+镜头+材质，标签化注入
+                positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, soft natural lighting, rim light, 85mm lens, shallow depth of field, realistic materials, high quality, ' + positive;
             }
         }
 
@@ -1077,7 +1083,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
