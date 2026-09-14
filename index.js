@@ -302,22 +302,21 @@
             positive = positive + ', object held in hand or standing on ground, natural hand holding object, five fingers, feet planted on ground, physically grounded';
         }
 
-        // ---- 人数强制（防多出人/少出人，智能判定，v5.2 覆盖姿势图场景）----
+        // ---- 人数强制（防多出人/少出人，智能判定）----
         // 按 inferExpectedPeople() 推断的人数锁定画面人数：
         //   单人 → 正面 solo 词 + 多人负面；双人 → 第三人/人群负面；三人 → 第四人负面；
-        //   空镜 → no people 负面。姿势图（poseFile）场景同样生效——用负面词约束数量，
-        //   不改姿势骨架、不与 ControlNet 冲突（正面只做单人限定，双/三人只加负面）。
-        // 修复截图问题：夫妻跳舞（pose=ballroom_dance）被画出"一男二女三人"仍通过审查。
+        //   空镜 → no people 负面。
+        // v6.0 统一路线：不再按姿势图/内容给豁免——所有图片（含姿势图）都走
+        //   同一套 人数锁定 + 性别锁定 + 肢体锁定 + QualityGate 审核 + 局部重绘。
         {
             const hay = (positive + ' ' + negative).toLowerCase();
             const expN = inferExpectedPeople();
             const hasPerson = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士)/i.test(positive);
             if (expN === 1 && hasPerson) {
-                // 非姿势图才注入正面 solo 词（姿势图由骨架决定人数，注入 solo 会与骨架冲突）；
                 // 负面"多人"词始终注入
-                // v5.9 性别锁定（独立于 solo 注入；姿势图不锁以免与骨架冲突）。
+                // v5.9/v6.0 性别锁定：所有场景（含姿势图）统一生效。
                 // 中英文性别词都识别：中文无空格边界，用 includes 判断。
-                if (!poseFile) {
+                {
                     const maleHits = /(^|[,\s])(man|boy|male|guy|gentleman|soldier)([,\s]|$)/i.test(positive) || /男人|男孩|男子|少年|帅哥|先生|王子|英雄/.test(positive);
                     const femaleHits = /(^|[,\s])(woman|girl|female|lady|heroine|nun)([,\s]|$)/i.test(positive) || /女人|女孩|女子|少女|女生|美女|女士|公主|女神/.test(positive);
                     if (maleHits && !femaleHits) {
@@ -332,7 +331,7 @@
                         negative = negative ? negative + ', ' + sexNeg : sexNeg;
                     }
                 }
-                if (!poseFile && !/(^|[,\s])(solo|single person|only one|alone)([,\s]|$)/i.test(positive)) {
+                if (!/(^|[,\s])(solo|single person|only one|alone)([,\s]|$)/i.test(positive)) {
                     let singleTag;
                     if (/(^|[,\s])(man|boy|male|guy|gentleman|soldier)([,\s]|$)/i.test(positive)) {
                         singleTag = '1man, solo, single person, only one man';
@@ -780,10 +779,11 @@
             if (res.images && res.images.length && settings.quality_inpaint !== false) {
                 let repaired = null;
                 let curImage = res.images[0].url;
-                // PASS 图只重画手部（脸/臂无问题不动，避免过度修改）；FAIL 图全量修复
-                const qcPassed = String(summary).startsWith('PASS');
+                // v6.0 统一审核重绘路线：PASS/FAIL 同一套逻辑——
+                // 全部按 QualityGate 检测框（脸/臂/手）重绘，检测框为空自然跳过。
+                // 不再按"内容"或 PASS/FAIL 分方向。
                 for (let rp = 0; rp < 3; rp++) {
-                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, qcPassed ? null : (armsMatch ? armsMatch[1] : null), handsMatch ? handsMatch[1] : null);
+                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, armsMatch ? armsMatch[1] : null, handsMatch ? handsMatch[1] : null);
                     if (!repaired) break;
                     if (repaired.error) {
                         gateFailures.push('inpaint:' + String(repaired.error).slice(0, 120));
