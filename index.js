@@ -72,10 +72,12 @@
         lora_trigger: 'XH_EA_FACE',  // LoRA 触发词（自动注入 positive 开头）
         sdxl_sampler: 'dpmpp_2m_sde',// SDXL 推荐采样器
         sdxl_scheduler: 'karras',    // SDXL 推荐调度器
-        sdxl_steps: 30,              // SDXL 推荐步数（Juggernaut 30-40）
-        sdxl_cfg: 4.5,               // SDXL 推荐 CFG（Juggernaut 3-6，勿用 SD1.5 的 7）
+        sdxl_steps: 26,              // SDXL 步数（v6.3d 提速：30→26，质量损失可忽略）
+        sdxl_cfg: 4.0,               // SDXL CFG（v6.3d 提速：4.5→4.0，Juggernaut 3-6 区间内）
         sdxl_width: 832,             // SDXL 竖图推荐宽度
         sdxl_height: 1216,           // SDXL 竖图推荐高度
+        hires_scale: 1.25,           // Hires Fix 放大倍率（v6.3d 提速：1.5x→1.25x，时间省约 40%）
+        hires_denoise: 0.35,         // Hires Fix 二次采样强度（v6.3d 提速：0.4→0.35）
     };
 
     // 姿势图库索引（与电脑端 Comfy input/pose_library/ 下的图片对应，供 LLM 选姿势）
@@ -419,6 +421,30 @@
             if (!/(east asian|asian face|asian features|chinese|korean|japanese|east-asian)/i.test(positive)) {
                 positive = 'east asian face, authentic asian facial features, ' + positive;
             }
+            // v6.3d 亚洲身材锁定：脸型已中国风，身材也锚定亚洲体型（纤细骨架、自然肤色）
+            if (!/(asian body|asian physique|asian figure|slender|petite)/i.test(positive)) {
+                positive = positive + ', east asian body type, slender asian physique, natural asian skin tone';
+            }
+        }
+
+        // ---- v6.3d 双人异性锁定：一男一女场景防止"男性丢失/变女性" ----
+        // 检测到男女对/夫妻/情侣关键词时，注入人数+性别锚定词与负面排除词
+        if (useSdxl) {
+            const hayLow = positive.toLowerCase();
+            const hasManWoman = (hayLow.includes('man') && hayLow.includes('woman'))
+                || /husband|wife|married couple|groom|bride/.test(hayLow)
+                || /夫妻|夫妇|老公|老婆|新郎|新娘/.test(a.positive || '');
+            if (hasManWoman) {
+                if (!/one man and one woman|exactly two people/.test(hayLow)) {
+                    positive = 'one man and one woman, exactly two people, male and female couple, ' + positive;
+                }
+                if (!/(masculine man|broad shoulders|short hair male|flat chest)/.test(hayLow)) {
+                    positive = positive + ', masculine man with short hair, broad shoulders, flat chest';
+                }
+                if (!/(two women|all female|no man)/.test(negative)) {
+                    negative = 'two women, all female, no man, androgynous, ' + negative;
+                }
+            }
         }
 
         // ---- 默认风格注入 ----
@@ -535,8 +561,9 @@
         // 手部/脸部细节像素翻倍，解决全身构图小图模糊。默认开；设置里可关。
         const hires = settings.hires_fix !== false;
         if (hires) {
-            const hw = Math.round(width * 1.5 / 2) * 2;
-            const hh = Math.round(height * 1.5 / 2) * 2;
+            const hiresScale = settings.hires_scale || 1.25;
+            const hw = Math.round(width * hiresScale / 2) * 2;
+            const hh = Math.round(height * hiresScale / 2) * 2;
             workflow['8a'] = {
                 class_type: 'ImageScale',
                 inputs: { image: ['8', 0], upscale_method: 'lanczos', width: hw, height: hh, crop: 'disabled' },
@@ -553,7 +580,7 @@
                     cfg: cfg,
                     sampler_name: samplerName,
                     scheduler: schedulerName,
-                    denoise: 0.4,
+                    denoise: settings.hires_denoise !== undefined ? settings.hires_denoise : 0.35,
                     model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
