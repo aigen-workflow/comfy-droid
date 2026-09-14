@@ -311,7 +311,7 @@
         {
             const hay = (positive + ' ' + negative).toLowerCase();
             const expN = inferExpectedPeople();
-            const hasPerson = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士)/i.test(positive);
+            const hasPerson = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士|女孩|女人|女生|女士|少女|男人|男生|男孩|小伙|姑娘|阿姨|大爷|大妈|妇人|少妇)/i.test(positive);
             if (expN === 1 && hasPerson) {
                 // 负面"多人"词始终注入
                 // v5.9/v6.0 性别锁定：所有场景（含姿势图）统一生效。
@@ -359,7 +359,7 @@
                     if (!/(^|[,\s])(1man|one man)([,\s]|$)/i.test(positive) || !/(^|[,\s])(1woman|one woman)([,\s]|$)/i.test(positive)) {
                         positive = '1man 1woman, ' + positive;
                     }
-                    const sexNeg = '2girls, two women, both women, two females, lesbian couple, 双女, 两个女人';
+                    const sexNeg = '2girls, two women, both women, two females, lesbian couple, single person, only one woman, lone woman, only one person, 双女, 两个女人, 单人, 一个人';
                     negative = negative ? negative + ', ' + sexNeg : sexNeg;
                 }
             } else if (expN === 3) {
@@ -408,9 +408,9 @@
         //       只有纯动作/无法判断人数时才回退 -1。
         function inferExpectedPeople() {
             const hay2 = (positive + ' ' + negative).toLowerCase();
-            const PAIR_HINTS2 = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', '双人', '两人', '一对', '二人', '夫妻', '夫妇', '情侣', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
+            const PAIR_HINTS2 = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', 'husband', 'wife', 'husband and wife', 'married couple', 'spouse', 'spouses', 'married', '双人', '两人', '一对', '二人', '夫妻', '夫妇', '情侣', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
             const MULTI_HINTS2 = ['three people', 'three women', 'three men', 'three men and', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', '多人', '人群', '群像', '一群', '军队', '战斗', '三人', '三个人', '三位'];
-            const hasPerson2 = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士)/i.test(positive);
+            const hasPerson2 = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|husband|wife|spouse|美女|女子|男子|人物|角色|战士|女孩|女人|女生|女士|少女|男人|男生|男孩|小伙|小伙|姑娘|阿姨|大爷|大妈|妇人|少妇)/i.test(positive);
             // 姿势图 + 提示词无人数线索（纯动作/场景描述）→ 无法判断，交给肢体/脸完整审查
             if (poseFile && !hasPerson2 && !PAIR_HINTS2.some((k) => hay2.includes(k)) && !MULTI_HINTS2.some((k) => hay2.includes(k))) return -1;
             // 具体人数优先：three/三人 → 3
