@@ -64,6 +64,17 @@
         realistic_enhance: true,     // 为 true 时出图注入写实增强（默认开启，越接近真实越好）
         quality_gate: true,          // 为 true 时出图后自动运行 QualityGate 人物质量审查，不合格自动换 seed 重试
         quality_retry: 3,            // 质量审查未通过时的最大重试次数（每次换新 seed）
+        use_sdxl: true,              // 为 true 时启用 SDXL 档（Juggernaut XL 方案）：SDXL 参数 + 亚洲脸 LoRA 自动注入
+        checkpoint_sdxl: 'juggernautXL_ragnarokBy.safetensors', // SDXL 底模（服务端 models/checkpoints 下）
+        lora_sdxl: 'authentic_asian_face_v1.safetensors',       // 亚洲脸 LoRA（服务端 models/loras 下）
+        lora_strength: 0.8,          // LoRA 权重（Civitai 推荐 0.8）
+        lora_trigger: 'XH_EA_FACE',  // LoRA 触发词（自动注入 positive 开头）
+        sdxl_sampler: 'dpmpp_2m_sde',// SDXL 推荐采样器
+        sdxl_scheduler: 'karras',    // SDXL 推荐调度器
+        sdxl_steps: 30,              // SDXL 推荐步数（Juggernaut 30-40）
+        sdxl_cfg: 4.5,               // SDXL 推荐 CFG（Juggernaut 3-6，勿用 SD1.5 的 7）
+        sdxl_width: 832,             // SDXL 竖图推荐宽度
+        sdxl_height: 1216,           // SDXL 竖图推荐高度
     };
 
     // 姿势图库索引（与电脑端 Comfy input/pose_library/ 下的图片对应，供 LLM 选姿势）
@@ -273,10 +284,14 @@
     // 1) 生成 ComfyUI API 格式工作流 JSON（SDXL 标准模板，节点编号固定）
     async function actionBuildWorkflow(args) {
         const a = args || {};
-        const width = a.width || settings.width;
-        const height = a.height || settings.height;
-        const steps = a.steps || settings.steps;
-        const cfg = a.cfg !== undefined && a.cfg !== null ? a.cfg : settings.cfg;
+        // v6.3 SDXL 档：use_sdxl=true 时默认用 SDXL 参数（用户显式传参优先）
+        const useSdxl = settings.use_sdxl !== false;
+        const width = a.width || (useSdxl ? settings.sdxl_width : settings.width);
+        const height = a.height || (useSdxl ? settings.sdxl_height : settings.height);
+        const steps = a.steps || (useSdxl ? settings.sdxl_steps : settings.steps);
+        const cfg = a.cfg !== undefined && a.cfg !== null ? a.cfg : (useSdxl ? settings.sdxl_cfg : settings.cfg);
+        const samplerName = useSdxl ? (settings.sdxl_sampler || 'dpmpp_2m_sde') : settings.sampler_name;
+        const schedulerName = useSdxl ? (settings.sdxl_scheduler || 'karras') : settings.scheduler;
         let positive = a.positive || '';
         let negative = a.negative || '';
         const poseFile = (a.pose_file || '').trim();
@@ -293,6 +308,11 @@
         // 对单/双/多人、姿势/空镜场景均无副作用，始终追加。
         const detailDefNeg = 'deformed fingers, extra fingers, six fingers, fused fingers, mutated hands, malformed hands, bad hand anatomy, floating object, levitating object, detached object, object not connected, anti-gravity, suspended object, gibberish text, mirrored text, random characters, chinese letters on object, text on object, caption, subtitle';
         negative = negative ? negative + ', ' + detailDefNeg : detailDefNeg;
+
+        // v6.3 NSFW 防御（无条件注入）：Juggernaut 等写实底模训练集含成人内容，
+        // 随机 seed 可能生成暴露画面；对所有合规题材（打斗/运动/日常/人物/风景）无副作用。
+        const nsfwNeg = 'nsfw, nude, nudity, explicit content, explicit sexual content, exposed body, topless, underwear, lingerie, semi-nude';
+        negative = negative ? negative + ', ' + nsfwNeg : nsfwNeg;
 
         // v5.5 正面：场景含随身物品时，强化"手持/落地"物理关系 + 自然手部，
         // 对抗 SD1.5"行李箱悬浮半空、手部糊"的典型失败（手机截图证据）。
@@ -387,6 +407,19 @@
             positive = 'masterpiece, best quality, highly detailed, ' + positive;
         }
 
+        // ---- v6.3 SDXL 亚洲审美锁定（Juggernaut XL 方案）----
+        // use_sdxl 时自动注入：①LoRA 触发词 XH_EA_FACE ②亚洲面孔词
+        // （解决"生成全是外国审美"的历史问题；对任意题材/人数均无副作用）
+        if (useSdxl) {
+            const trig = String(settings.lora_trigger || '').trim();
+            if (trig && positive.indexOf(trig) === -1) {
+                positive = trig + ', ' + positive;
+            }
+            if (!/(east asian|asian face|asian features|chinese|korean|japanese|east-asian)/i.test(positive)) {
+                positive = 'east asian face, authentic asian facial features, ' + positive;
+            }
+        }
+
         // ---- 默认风格注入 ----
         // 默认写实增强（realistic_enhance=true，越接近真实越好）；开启 comic_style 时改为漫画渲染。
         // 用户显式指定其他风格（anime/manga/cartoon/油画/水彩等）时不重复注入。
@@ -433,6 +466,9 @@
             return JSON.stringify({ error: '未配置 checkpoint 模型名，请在扩展设置中填写（Comfy 服务端 models/checkpoints 下的文件名）' });
         }
 
+        // v6.3: use_sdxl 时插入 LoraLoader（亚洲脸 LoRA），KSampler/CLIPTextEncode 全部改接 LoRA 输出
+        const modelRef = useSdxl ? ['4a', 0] : ['4', 0];
+        const clipRef = useSdxl ? ['4a', 1] : ['4', 1];
         const workflow = {
             '3': {
                 class_type: 'KSampler',
@@ -440,10 +476,10 @@
                     seed: Math.floor(Math.random() * 1000000000000000),
                     steps: steps,
                     cfg: cfg,
-                    sampler_name: settings.sampler_name,
-                    scheduler: settings.scheduler,
+                    sampler_name: samplerName,
+                    scheduler: schedulerName,
                     denoise: 1,
-                    model: ['4', 0],
+                    model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
                     latent_image: ['5', 0],
@@ -453,17 +489,36 @@
                 class_type: 'CheckpointLoaderSimple',
                 inputs: { ckpt_name: settings.checkpoint },
             },
+            '4a': useSdxl ? {
+                class_type: 'LoraLoader',
+                inputs: {
+                    model: ['4', 0],
+                    clip: ['4', 1],
+                    lora_name: settings.lora_sdxl || 'authentic_asian_face_v1.safetensors',
+                    strength_model: settings.lora_strength !== undefined ? settings.lora_strength : 0.8,
+                    strength_clip: settings.lora_strength !== undefined ? settings.lora_strength : 0.8,
+                },
+            } : {
+                class_type: 'LoraLoader',
+                inputs: {
+                    model: ['4', 0],
+                    clip: ['4', 1],
+                    lora_name: 'none',
+                    strength_model: 0,
+                    strength_clip: 0,
+                },
+            },
             '5': {
                 class_type: 'EmptyLatentImage',
                 inputs: { width: width, height: height, batch_size: 1 },
             },
             '6': {
                 class_type: 'CLIPTextEncode',
-                inputs: { text: positive, clip: ['4', 1] },
+                inputs: { text: positive, clip: clipRef },
             },
             '7': {
                 class_type: 'CLIPTextEncode',
-                inputs: { text: negative, clip: ['4', 1] },
+                inputs: { text: negative, clip: clipRef },
             },
             '8': {
                 class_type: 'VAEDecode',
@@ -495,10 +550,10 @@
                     seed: Math.floor(Math.random() * 1000000000000000),
                     steps: Math.max(12, Math.round(steps * 0.66)),
                     cfg: cfg,
-                    sampler_name: settings.sampler_name,
-                    scheduler: settings.scheduler,
+                    sampler_name: samplerName,
+                    scheduler: schedulerName,
                     denoise: 0.4,
-                    model: ['4', 0],
+                    model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
                     latent_image: ['8b', 0],
@@ -889,6 +944,23 @@
                 '6b': { class_type: 'CLIPTextEncode', inputs: { text: handPos, clip: ['4', 1] } },
                 '7': { class_type: 'CLIPTextEncode', inputs: { text: negative, clip: ['4', 1] } },
             };
+            // v6.3：SDXL 档重绘同样注入亚洲脸 LoRA，保持修复区与原图人脸一致
+            if (settings.use_sdxl !== false) {
+                wf['4a'] = {
+                    class_type: 'LoraLoader',
+                    inputs: {
+                        model: ['4', 0],
+                        clip: ['4', 1],
+                        lora_name: settings.lora_sdxl || 'authentic_asian_face_v1.safetensors',
+                        strength_model: settings.lora_strength !== undefined ? settings.lora_strength : 0.8,
+                        strength_clip: settings.lora_strength !== undefined ? settings.lora_strength : 0.8,
+                    },
+                };
+                wf['6'].inputs.clip = ['4a', 1];
+                wf['6a'].inputs.clip = ['4a', 1];
+                wf['6b'].inputs.clip = ['4a', 1];
+                wf['7'].inputs.clip = ['4a', 1];
+            }
             // 任务列表：face（denoise 0.5）优先，arm（denoise 0.4）随后，hand（denoise 0.45）最后
             const tasks = [];
             for (const b of faceBoxes) tasks.push({ box: b, denoise: 0.5, pos: ['6', 0] });
@@ -918,10 +990,10 @@
                 wf[sampId] = { class_type: 'KSampler', inputs: {
                     seed: Math.floor(Math.random() * 1000000000000000),
                     steps: 30, cfg: 5.5,
-                    sampler_name: settings.sampler_name || 'dpmpp_2m',
-                    scheduler: settings.scheduler || 'karras',
+                    sampler_name: (settings.use_sdxl !== false) ? (settings.sdxl_sampler || 'dpmpp_2m_sde') : (settings.sampler_name || 'dpmpp_2m'),
+                    scheduler: (settings.use_sdxl !== false) ? (settings.sdxl_scheduler || 'karras') : (settings.scheduler || 'karras'),
                     denoise: t.denoise,
-                    model: ['4', 0], positive: t.pos, negative: ['7', 0], latent_image: [encId, 0],
+                    model: (settings.use_sdxl !== false) ? ['4a', 0] : ['4', 0], positive: t.pos, negative: ['7', 0], latent_image: [encId, 0],
                 } };
                 wf[decId] = { class_type: 'VAEDecode', inputs: { samples: [sampId, 0], vae: ['4', 2] } };
                 wf[scaleDnId] = { class_type: 'ImageScale', inputs: { image: [decId, 0], upscale_method: 'nearest-exact', width: box.w, height: box.h, crop: 'disabled' } };
@@ -1130,6 +1202,9 @@
               <label class="checkbox_label" for="cd_quality_gate">
                 <input type="checkbox" id="cd_quality_gate"> 质量审查（出图后自动检测畸形，不合格换 seed 重试，推荐开启）
               </label>
+              <label class="checkbox_label" for="cd_use_sdxl">
+                <input type="checkbox" id="cd_use_sdxl"> SDXL 档（Juggernaut XL + 亚洲脸 LoRA：832×1216 / CFG 4.5 / 30步，推荐开启）
+              </label>
               <div style="margin-top:8px;">
                 <label for="cd_endpoint">Comfy 服务地址（含协议，如 https://xxx.trycloudflare.com）</label>
                 <input id="cd_endpoint" class="text_pole" placeholder="https://...">
@@ -1181,6 +1256,8 @@
         if (injectEl) injectEl.checked = !!settings.inject_prompt;
         const qualityGateEl = document.getElementById('cd_quality_gate');
         if (qualityGateEl) qualityGateEl.checked = !!settings.quality_gate;
+        const useSdxlEl = document.getElementById('cd_use_sdxl');
+        if (useSdxlEl) useSdxlEl.checked = settings.use_sdxl !== false;
 
         // 绑定保存
         const bindSave = (id, key, coerce) => {
@@ -1220,6 +1297,12 @@
         if (qualityGateEl) {
             qualityGateEl.addEventListener('change', () => {
                 settings.quality_gate = qualityGateEl.checked;
+                saveSettingsDebounced();
+            });
+        }
+        if (useSdxlEl) {
+            useSdxlEl.addEventListener('change', () => {
+                settings.use_sdxl = useSdxlEl.checked;
                 saveSettingsDebounced();
             });
         }
