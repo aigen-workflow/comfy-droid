@@ -58,7 +58,8 @@
         inject_prompt: true,         // 为 true 时向用户消息注入“绘图工具可用”提示，压制预设对工具调用的干扰
         pose_enabled: true,          // 为 true 时，复杂双人动作自动从姿势图库选图锁姿势
         pose_strength: 0.7,          // ControlNet 姿势控制强度（0.65~0.75 推荐）
-        pose_controlnet: 'control_v11p_sd15_openpose.pth', // 服务端 models/controlnet 下的 OpenPose 模型
+        pose_controlnet: 'control_v11p_sd15_openpose.pth', // 服务端 models/controlnet 下的 OpenPose 模型（SD1.5 档）
+        pose_controlnet_sdxl: 'controlnet-openpose-sdxl-1.0.safetensors', // SDXL 档的 OpenPose（SDXL 主模型必须配 SDXL ControlNet，否则执行报错）
         pose_library_dir: 'pose_library', // 姿势图库目录（相对 Comfy 服务端 input 目录）
         comic_style: false,          // 为 true 时出图注入漫画渲染风格（黑白/网点线稿）；默认关闭
         realistic_enhance: true,     // 为 true 时出图注入写实增强（默认开启，越接近真实越好）
@@ -584,7 +585,7 @@
             };
             workflow['22'] = {
                 class_type: 'ControlNetLoader',
-                inputs: { control_net_name: settings.pose_controlnet },
+                inputs: { control_net_name: useSdxl ? (settings.pose_controlnet_sdxl || settings.pose_controlnet) : settings.pose_controlnet },
             };
             workflow['23'] = {
                 class_type: 'ControlNetApply',
@@ -795,9 +796,9 @@
                 return JSON.stringify({ error: '提交失败：' + (sub.error || submitRaw) });
             }
 
-            // 3) 轮询出图（最长 150 秒，每 2 秒一次；含审查节点时 OpenPose 检测需额外时间）
+            // 3) 轮询出图（最长 300 秒，每 2 秒一次；SDXL + hires + 审查链需 2-3 分钟，150 秒不够）
             let res = null;
-            for (let i = 0; i < 75; i++) {
+            for (let i = 0; i < 150; i++) {
                 await sleep(2000);
                 try {
                     res = JSON.parse(await actionCheckProgress({ prompt_id: pid }));
@@ -807,7 +808,7 @@
                 if (res.status === 'done' || res.status === 'error') break;
             }
             if (!res) {
-                return JSON.stringify({ status: 'timeout', prompt_id: pid, message: '轮询超时（150秒），可调用 comfy_check_progress 继续查询' });
+                return JSON.stringify({ status: 'timeout', prompt_id: pid, message: '轮询超时（300秒），可调用 comfy_check_progress 继续查询' });
             }
             if (res.status === 'error') {
                 return JSON.stringify(res);
