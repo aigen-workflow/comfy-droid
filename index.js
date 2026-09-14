@@ -281,6 +281,12 @@
         let negative = a.negative || '';
         const poseFile = (a.pose_file || '').trim();
 
+        // ---- 多头/鬼影脸负面词（无条件注入，任何场景都防"多头"） ----
+        // 多头是 SD 多人/姿势图最常见畸形：模型在人物旁边多画一个头/脸。
+        // 该组词对单人/双人/姿势/多人场景均无副作用，始终追加。
+        const multiHeadNeg = 'extra head, two heads, duplicate head, extra face, second face, ghost head, merged head, head growing from body, face on shoulder, face on chest';
+        negative = negative ? negative + ', ' + multiHeadNeg : multiHeadNeg;
+
         // ---- 单人强制（防多出人，智能判定）----
         // 仅当：有人物指示 + 无 pose_file + 无双人/多人意图 + 非纯环境空镜 时，
         // 才注入单人限定与多人负面排除。避免“一个美女”被画出多人，
@@ -577,6 +583,7 @@
         const maxAttempts = Math.max(1, settings.quality_retry || 3);
         const gateFailures = [];
         let lastResult = null;
+        let lastRepaired = null;  // 记录最后一次局部修复结果（全部失败时优先交付修复版，而非原始畸形图）
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             // 1) 生成工作流（内部会保存 lastWorkflowJson）；第 2 次起强制换新 seed
@@ -647,8 +654,10 @@
                 res.quality_attempts = attempt;
                 return JSON.stringify(res);
             }
-            // FAIL：优先尝试局部放大重绘（boxes=脸区、arms=手臂区）；最多重试 2 轮（seed 随机性），
-            // 仍 FAIL 才换 seed 整图重试
+            // FAIL：优先尝试局部放大重绘（boxes=脸区、arms=手臂区）；最多修复 3 轮
+            // （每轮基于已修复图再修），仍 FAIL 才换 seed 整图重试。
+            // "只要不是完整真实的人就继续局部重绘"：修复轮内始终以最新修复结果为输入，
+            // 复审阈值（min_face_kp=10）要求面部关键点恢复到基本完整，防止"变形脸蒙混通过"。
             gateFailures.push(String(summary));
             const boxesMatch = String(summary).match(/boxes=([0-9,;]+)/);
             const armsMatch = String(summary).match(/arms=([0-9,;]+)/);
@@ -656,7 +665,7 @@
             if ((boxesMatch || armsMatch) && res.images && res.images.length && settings.quality_inpaint !== false) {
                 let repaired = null;
                 let curImage = res.images[0].url;
-                for (let rp = 0; rp < 2; rp++) {
+                for (let rp = 0; rp < 3; rp++) {
                     repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, armsMatch ? armsMatch[1] : null);
                     if (!repaired) break;
                     if (repaired.error) {
@@ -666,6 +675,7 @@
                     if (repaired.quality_gate && String(repaired.quality_gate).startsWith('PASS')) break;
                     // 基于已修复图再修一轮（OpenPose 对动态角度脸会误报，多一轮提高通过率）
                     curImage = (repaired.images && repaired.images[0] && repaired.images[0].url) || curImage;
+                    lastRepaired = repaired;
                 }
                 if (repaired && repaired.quality_gate && String(repaired.quality_gate).startsWith('PASS')) {
                     repaired.quality_attempts = attempt;
@@ -679,11 +689,15 @@
             }
         }
 
-        // 5) 全部尝试均未通过审查：交付最后一次结果并附警告
-        if (lastResult) {
-            lastResult.quality_gate = 'FAIL after ' + maxAttempts + ' attempts: ' + gateFailures.join(' || ');
-            lastResult.quality_attempts = maxAttempts;
-            return JSON.stringify(lastResult);
+        // 5) 全部尝试均未通过审查：不交付原始畸形图。
+        //    有局部修复结果则交付"最后一次修复版"（比原始图接近完整），否则交付原图，
+        //    两种情况都附 FAIL 警告，让用户知道这张未通过"完整人审核"。
+        const finalRes = lastRepaired || lastResult;
+        if (finalRes) {
+            finalRes.quality_gate = 'FAIL after ' + maxAttempts + ' attempts: ' + gateFailures.join(' || ');
+            finalRes.quality_attempts = maxAttempts;
+            if (lastRepaired) finalRes.quality_repair = true;
+            return JSON.stringify(finalRes);
         }
         return JSON.stringify({ status: 'error', message: '出图失败且无可交付结果' });
     }
@@ -738,7 +752,7 @@
             const uploadedName = (upJson && upJson.name) || srcName;
 
             // 2) 构造多区域放大重绘工作流（脸区 + 手臂区）
-            const negative = args.negative || 'lowres, bad anatomy, bad hands, deformed, disfigured, extra limbs, worst quality, low quality, blurry, watermark, nsfw, profile view, side view, looking away';
+            const negative = args.negative || 'lowres, bad anatomy, bad hands, deformed, disfigured, extra limbs, extra head, two heads, duplicate head, extra face, worst quality, low quality, blurry, watermark, nsfw, profile view, side view, looking away';
             const facePos = 'portrait, facing forward, looking at camera, front view face, natural facial features, detailed face, smooth skin, sharp focus, high quality, keep original face identity';
             const armPos = 'martial arts pose, raised arm with clenched fist, well-proportioned arm, toned arm muscles, natural arm anatomy, sharp focus, high quality';
             const wf = {
@@ -793,9 +807,9 @@
                 // 节点 id 动态分配，避免与区域修复子链的 id 冲突
                 const qgId = String(nid++);
                 const stId = String(nid++);
-                // 修复后复审用宽松阈值（min_face_kp=6）：目标从"完美"降为"不再重度残缺"，
-                // 因 OpenPose 对动态角度/汗珠/小脸常检不全（6+ 即视为已修复），初次审查仍用严格 20
-                wf[qgId] = { class_type: 'QualityGate', inputs: { image: [lastNode, 0], expected_people: inferExpectedPeople(args), min_body_kp: 10, min_face_kp: 6 } };
+                // 修复后复审：min_face_kp=10 —— 要求面部关键点恢复到"基本完整"，
+                // 防止重度变形脸（仅 6 点）蒙混通过；OpenPose 对正常脸通常能检出 15+ 点。
+                wf[qgId] = { class_type: 'QualityGate', inputs: { image: [lastNode, 0], expected_people: inferExpectedPeople(args), min_body_kp: 10, min_face_kp: 10 } };
                 wf[stId] = { class_type: 'SaveText', inputs: { text: [qgId, 5], filename_prefix: 'qg_inpaint', format: 'txt' } };
             }
 
