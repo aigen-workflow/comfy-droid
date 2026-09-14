@@ -287,19 +287,20 @@
         const multiHeadNeg = 'extra head, two heads, duplicate head, extra face, second face, ghost head, merged head, head growing from body, face on shoulder, face on chest';
         negative = negative ? negative + ', ' + multiHeadNeg : multiHeadNeg;
 
-        // ---- 单人强制（防多出人，智能判定）----
-        // 仅当：有人物指示 + 无 pose_file + 无双人/多人意图 + 非纯环境空镜 时，
-        // 才注入单人限定与多人负面排除。避免“一个美女”被画出多人，
-        // 同时不误伤双人/多人/环境/空镜场景；注入词按人物性别自动匹配。
-        if (!poseFile) {
-            const PAIR_HINTS = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', '双人', '两人', '一对', '二人', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
-            const MULTI_HINTS = ['three people', 'three women', 'three men', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', '多人', '人群', '群像', '一群', '军队', '战斗'];
+        // ---- 人数强制（防多出人/少出人，智能判定，v5.2 覆盖姿势图场景）----
+        // 按 inferExpectedPeople() 推断的人数锁定画面人数：
+        //   单人 → 正面 solo 词 + 多人负面；双人 → 第三人/人群负面；三人 → 第四人负面；
+        //   空镜 → no people 负面。姿势图（poseFile）场景同样生效——用负面词约束数量，
+        //   不改姿势骨架、不与 ControlNet 冲突（正面只做单人限定，双/三人只加负面）。
+        // 修复截图问题：夫妻跳舞（pose=ballroom_dance）被画出"一男二女三人"仍通过审查。
+        {
             const hay = (positive + ' ' + negative).toLowerCase();
+            const expN = inferExpectedPeople();
             const hasPerson = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士)/i.test(positive);
-            const isPair = PAIR_HINTS.some((k) => hay.includes(k));
-            const isMulti = MULTI_HINTS.some((k) => hay.includes(k));
-            if (hasPerson && !isPair && !isMulti) {
-                if (!/(^|[,\s])(solo|single person|only one|alone)([,\s]|$)/i.test(positive)) {
+            if (expN === 1 && hasPerson) {
+                // 非姿势图才注入正面 solo 词（姿势图由骨架决定人数，注入 solo 会与骨架冲突）；
+                // 负面"多人"词始终注入
+                if (!poseFile && !/(^|[,\s])(solo|single person|only one|alone)([,\s]|$)/i.test(positive)) {
                     let singleTag;
                     if (/(^|[,\s])(man|boy|male|guy|gentleman|soldier)([,\s]|$)/i.test(positive)) {
                         singleTag = '1man, solo, single person, only one man';
@@ -311,6 +312,16 @@
                     positive = singleTag + ', ' + positive;
                 }
                 const extraNeg = 'two people, multiple people, extra person, group of people';
+                negative = negative ? negative + ', ' + extraNeg : extraNeg;
+            } else if (expN === 2) {
+                // 双人场景：禁止第三人/额外人物（原逻辑只在非 pose 场景有双人词，pose 场景漏掉）
+                const extraNeg = 'third person, extra person, three people, group of people, additional figure';
+                negative = negative ? negative + ', ' + extraNeg : extraNeg;
+            } else if (expN === 3) {
+                const extraNeg = 'fourth person, extra person, crowd, group of people';
+                negative = negative ? negative + ', ' + extraNeg : extraNeg;
+            } else if (expN === 0) {
+                const extraNeg = 'person, people, figure, human, 人物, 人影';
                 negative = negative ? negative + ', ' + extraNeg : extraNeg;
             }
         }
@@ -335,13 +346,21 @@
         }
 
         // ---- 期望人数推断（供质量审查用）----
-        // 0=空镜(应无人) 1=单人 2=双人 -1=多人/姿势锁定(不锁人数，只查肢体/脸完整)
+        // 0=空镜(应无人) 1=单人 2=双人 3=三人 -1=无法判断(只查肢体/脸完整)
+        // v5.2：姿势图场景不再一律 -1——"夫妻/双人/一对"等明确人数提示必须锁人数，
+        //       否则"1对夫妻"会被画出 3 人仍通过审查（详见手机截图 ComfyDroid_00130 三人相拥）。
+        //       只有纯动作/无法判断人数时才回退 -1。
         function inferExpectedPeople() {
-            if (poseFile) return -1;
             const hay2 = (positive + ' ' + negative).toLowerCase();
-            const PAIR_HINTS2 = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', '双人', '两人', '一对', '二人', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
-            const MULTI_HINTS2 = ['three people', 'three women', 'three men', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', '多人', '人群', '群像', '一群', '军队', '战斗'];
+            const PAIR_HINTS2 = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', '双人', '两人', '一对', '二人', '夫妻', '夫妇', '情侣', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
+            const MULTI_HINTS2 = ['three people', 'three women', 'three men', 'three men and', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', '多人', '人群', '群像', '一群', '军队', '战斗', '三人', '三个人', '三位'];
             const hasPerson2 = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|美女|女子|男子|人物|角色|战士)/i.test(positive);
+            // 姿势图 + 提示词无人数线索（纯动作/场景描述）→ 无法判断，交给肢体/脸完整审查
+            if (poseFile && !hasPerson2 && !PAIR_HINTS2.some((k) => hay2.includes(k)) && !MULTI_HINTS2.some((k) => hay2.includes(k))) return -1;
+            // 具体人数优先：three/三人 → 3
+            if (/three|3\s*(men|women|people|girls)|三人|三个人|三位|三个/.test(hay2)) return 3;
+            // 显式男女对（man+woman 同时出现 = 双人），处理 "one man and one woman" 等变体
+            if (/\bman\b.*\bwoman\b|\bwoman\b.*\bman\b|一对男女|一男一女/.test(hay2)) return 2;
             if (MULTI_HINTS2.some((k) => hay2.includes(k))) return -1;
             if (PAIR_HINTS2.some((k) => hay2.includes(k))) return 2;
             if (hasPerson2) return 1;
@@ -955,7 +974,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成图|壁纸|封面|海报|头像|插画|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[系统] 你已接入 Comfy 绘图工具链（工具：comfy_generate_image）。本条消息疑似要求生成图片：请调用 comfy_generate_image 直接出图，按你的角色风格撰写英文正向提示词；除非用户明确要求写故事，否则不要把它当作写作任务，不要用文字描述代替出图。工具返回图片链接后，必须在最终回复中用 ![image](图片链接) 把图片展示出来，绝对禁止回复“没有新画面，未出图”等不含图片链接的文字。';
+    const INJECT_TEXT = '\n\n[系统] 你已接入 Comfy 绘图工具链（工具：comfy_generate_image）。本条 User 消息含有绘图意图，属于新的绘图请求：即使它与历史中的某条消息相同、或历史里已经回复过图片，也必须把本条当作全新任务，调用 comfy_generate_image 重新出图，禁止因“历史已答过 / 无新短句”跳过工具、禁止直接复述或重发上一张旧图。请按你的角色风格撰写英文正向提示词；除非用户明确要求写故事，否则不要把它当作写作任务，不要用文字描述代替出图。工具返回图片链接后，必须在最终回复中用 ![image](本次新生成图片链接) 把图片展示出来，绝对禁止回复“没有新画面，未出图”、禁止返回上一张图的链接、禁止任何不含本次新图片链接的文字。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
