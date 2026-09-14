@@ -442,6 +442,42 @@
             },
         };
 
+        // v5.7 Hires Fix：768 基础图放大 1.5x 二次采样（denoise 0.4），
+        // 手部/脸部细节像素翻倍，解决全身构图小图模糊。默认开；设置里可关。
+        const hires = settings.hires_fix !== false;
+        if (hires) {
+            const hw = Math.round(width * 1.5 / 2) * 2;
+            const hh = Math.round(height * 1.5 / 2) * 2;
+            workflow['8a'] = {
+                class_type: 'ImageScale',
+                inputs: { image: ['8', 0], upscale_method: 'lanczos', width: hw, height: hh, crop: 'disabled' },
+            };
+            workflow['8b'] = {
+                class_type: 'VAEEncode',
+                inputs: { pixels: ['8a', 0], vae: ['4', 2] },
+            };
+            workflow['8c'] = {
+                class_type: 'KSampler',
+                inputs: {
+                    seed: Math.floor(Math.random() * 1000000000000000),
+                    steps: Math.max(12, Math.round(steps * 0.66)),
+                    cfg: cfg,
+                    sampler_name: settings.sampler_name,
+                    scheduler: settings.scheduler,
+                    denoise: 0.4,
+                    model: ['4', 0],
+                    positive: ['6', 0],
+                    negative: ['7', 0],
+                    latent_image: ['8b', 0],
+                },
+            };
+            workflow['8d'] = {
+                class_type: 'VAEDecode',
+                inputs: { samples: ['8c', 0], vae: ['4', 2] },
+            };
+            workflow['9'].inputs.images = ['8d', 0];
+        }
+
         // 姿势锁定：从图库加载姿势图 → OpenPose 提取骨骼 → ControlNet 锁姿势
         if (settings.pose_enabled && poseFile) {
             workflow['20'] = {
@@ -481,7 +517,7 @@
             workflow['30'] = {
                 class_type: 'QualityGate',
                 inputs: {
-                    image: ['8', 0],
+                    image: hires ? ['8d', 0] : ['8', 0],
                     expected_people: inferExpectedPeople(),
                     min_body_kp: 10,
                     min_face_kp: 20,
@@ -709,12 +745,13 @@
             gateFailures.push(String(summary));
             const boxesMatch = String(summary).match(/boxes=([0-9,;]+)/);
             const armsMatch = String(summary).match(/arms=([0-9,;]+)/);
+            const handsMatch = String(summary).match(/hands=([0-9,;]+)/);
             const maskMatch = String(summary).match(/mask=(masks\/[^|]+)/);
-            if ((boxesMatch || armsMatch) && res.images && res.images.length && settings.quality_inpaint !== false) {
+            if ((boxesMatch || armsMatch || handsMatch) && res.images && res.images.length && settings.quality_inpaint !== false) {
                 let repaired = null;
                 let curImage = res.images[0].url;
                 for (let rp = 0; rp < 3; rp++) {
-                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, armsMatch ? armsMatch[1] : null);
+                    repaired = await tryInpaintRepair(curImage, boxesMatch ? boxesMatch[1] : null, maskMatch ? maskMatch[1] : null, a, armsMatch ? armsMatch[1] : null, handsMatch ? handsMatch[1] : null);
                     if (!repaired) break;
                     if (repaired.error) {
                         gateFailures.push('inpaint:' + String(repaired.error).slice(0, 120));
@@ -774,9 +811,10 @@
 
     // 局部放大重绘：把出图下载后上传到 Comfy input，
     // 对每个问题区域做「裁切 → 放大 ~800 长边 → 低 denoise 重绘 → 缩回 → 贴回」，
-    // 脸区（boxes）denoise 0.5 + 正面提示词；手臂区（arms）denoise 0.4 + 手臂提示词。
+    // 脸区（boxes）denoise 0.5 + 正面提示词；手臂区（arms）denoise 0.4 + 手臂提示词；
+    // v5.6 手部区（hands）denoise 0.45 + 自然手部提示词。
     // 最后 QualityGate 复审，PASS 即交付。
-    async function tryInpaintRepair(imageUrl, boxesStr, maskFile, args, armsStr) {
+    async function tryInpaintRepair(imageUrl, boxesStr, maskFile, args, armsStr, handsStr) {
         const base = settings.comfy_endpoint.replace(/\/+$/, '');
         try {
             const parseBoxes = (s) => String(s || '').split(';').filter(Boolean).map((b) => {
@@ -787,7 +825,8 @@
             }).filter((b) => b && b.w >= 8 && b.h >= 8);
             const faceBoxes = parseBoxes(boxesStr);
             const armBoxes = parseBoxes(armsStr);
-            if (!faceBoxes.length && !armBoxes.length) return { error: '无有效修复区域' };
+            const handBoxes = parseBoxes(handsStr);
+            if (!faceBoxes.length && !armBoxes.length && !handBoxes.length) return { error: '无有效修复区域' };
 
             // 1) 下载出图 → 上传到 Comfy input
             const imgResp = await fetch(imageUrl);
@@ -803,17 +842,20 @@
             const negative = args.negative || 'lowres, bad anatomy, bad hands, deformed, disfigured, extra limbs, extra head, two heads, duplicate head, extra face, worst quality, low quality, blurry, watermark, nsfw, profile view, side view, looking away';
             const facePos = 'portrait, facing forward, looking at camera, front view face, natural facial features, detailed face, smooth skin, sharp focus, high quality, keep original face identity';
             const armPos = 'martial arts pose, raised arm with clenched fist, well-proportioned arm, toned arm muscles, natural arm anatomy, sharp focus, high quality';
+            const handPos = 'natural human hand, five fingers, well-proportioned fingers, detailed realistic hand, natural hand anatomy, fingers clearly separated, sharp focus, high quality';
             const wf = {
                 '1': { class_type: 'LoadImage', inputs: { image: uploadedName } },
                 '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: settings.checkpoint } },
                 '6': { class_type: 'CLIPTextEncode', inputs: { text: facePos, clip: ['4', 1] } },
                 '6a': { class_type: 'CLIPTextEncode', inputs: { text: armPos, clip: ['4', 1] } },
+                '6b': { class_type: 'CLIPTextEncode', inputs: { text: handPos, clip: ['4', 1] } },
                 '7': { class_type: 'CLIPTextEncode', inputs: { text: negative, clip: ['4', 1] } },
             };
-            // 任务列表：face（denoise 0.5）优先，arm（denoise 0.4）随后
+            // 任务列表：face（denoise 0.5）优先，arm（denoise 0.4）随后，hand（denoise 0.45）最后
             const tasks = [];
             for (const b of faceBoxes) tasks.push({ box: b, denoise: 0.5, pos: ['6', 0] });
             for (const b of armBoxes) tasks.push({ box: b, denoise: 0.4, pos: ['6a', 0] });
+            for (const b of handBoxes) tasks.push({ box: b, denoise: 0.45, pos: ['6b', 0] });
             let nid = 10;
             let destRef = ['1', 0];
             let lastNode = null;
