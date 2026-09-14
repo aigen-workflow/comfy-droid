@@ -287,6 +287,21 @@
         const multiHeadNeg = 'extra head, two heads, duplicate head, extra face, second face, ghost head, merged head, head growing from body, face on shoulder, face on chest';
         negative = negative ? negative + ', ' + multiHeadNeg : multiHeadNeg;
 
+        // ---- v5.5 全局肢体/物体防御（无条件注入）----
+        // 手机端截图证据：站台场景"红色行李箱悬浮半空+箱体镜像乱码字+手部细节糊"
+        // SD1.5 在元素多/分辨率低时三连败：手部畸形、物理悬空、乱码文字。以下负面
+        // 对单/双/多人、姿势/空镜场景均无副作用，始终追加。
+        const detailDefNeg = 'deformed fingers, extra fingers, six fingers, fused fingers, mutated hands, malformed hands, bad hand anatomy, floating object, levitating object, detached object, object not connected, anti-gravity, suspended object, gibberish text, mirrored text, random characters, chinese letters on object, text on object, caption, subtitle';
+        negative = negative ? negative + ', ' + detailDefNeg : detailDefNeg;
+
+        // v5.5 正面：场景含随身物品时，强化"手持/落地"物理关系 + 自然手部，
+        // 对抗 SD1.5"行李箱悬浮半空、手部糊"的典型失败（手机截图证据）。
+        const OBJECT_HINTS = ['suitcase', 'luggage', 'bag', 'backpack', 'handbag', 'phone', 'bottle', 'umbrella', '箱', '行李', '背包', '手提包', '手机', '伞', '水瓶'];
+        const hasObject = OBJECT_HINTS.some((k) => positive.toLowerCase().includes(k));
+        if (hasObject && !/(held in hand|standing on ground|in his hand|in her hand|carrying|holding)/i.test(positive)) {
+            positive = positive + ', object held in hand or standing on ground, natural hand holding object, five fingers, feet planted on ground, physically grounded';
+        }
+
         // ---- 人数强制（防多出人/少出人，智能判定，v5.2 覆盖姿势图场景）----
         // 按 inferExpectedPeople() 推断的人数锁定画面人数：
         //   单人 → 正面 solo 词 + 多人负面；双人 → 第三人/人群负面；三人 → 第四人负面；
