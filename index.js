@@ -287,12 +287,15 @@
     // 1) 生成 ComfyUI API 格式工作流 JSON（SDXL 标准模板，节点编号固定）
     async function actionBuildWorkflow(args) {
         const a = args || {};
-        // v6.3 SDXL 档：use_sdxl=true 时默认用 SDXL 参数（用户显式传参优先）
+        // v6.3 SDXL 档：use_sdxl=true 时默认用 SDXL 参数。
+        // v6.4 SDXL 档强制锁定参数：模型经常按角色卡旧默认值传 cfg=7/steps=28/尺寸，
+        // 会破坏 SDXL 参数档（Lightning 需 cfg 3-6、steps 26）。SDXL 档一律忽略模型传参，
+        // 只接收 positive/negative/pose_file；SD1.5 档保持模型传参优先。
         const useSdxl = settings.use_sdxl !== false;
-        const width = a.width || (useSdxl ? settings.sdxl_width : settings.width);
-        const height = a.height || (useSdxl ? settings.sdxl_height : settings.height);
-        const steps = a.steps || (useSdxl ? settings.sdxl_steps : settings.steps);
-        const cfg = a.cfg !== undefined && a.cfg !== null ? a.cfg : (useSdxl ? settings.sdxl_cfg : settings.cfg);
+        const width = useSdxl ? settings.sdxl_width : (a.width || settings.width);
+        const height = useSdxl ? settings.sdxl_height : (a.height || settings.height);
+        const steps = useSdxl ? settings.sdxl_steps : (a.steps || settings.steps);
+        const cfg = useSdxl ? settings.sdxl_cfg : (a.cfg !== undefined && a.cfg !== null ? a.cfg : settings.cfg);
         const samplerName = useSdxl ? (settings.sdxl_sampler || 'dpmpp_2m_sde') : settings.sampler_name;
         const schedulerName = useSdxl ? (settings.sdxl_scheduler || 'karras') : settings.scheduler;
         let positive = a.positive || '';
@@ -766,7 +769,7 @@
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
-    async function actionGenerateImage(args) {
+    async function actionGenerateImageInner(args) {
         const a = args || {};
         if (!settings.comfy_endpoint) {
             return JSON.stringify({ error: '未配置 Comfy 服务地址，请在扩展设置中填写' });
@@ -777,6 +780,22 @@
         const positive = a.positive || '';
         if (!String(positive).trim()) {
             return JSON.stringify({ error: '缺少正向提示词 positive' });
+        }
+
+        // ---- v6.4 出图熔断：同一请求内模型连续调用生成函数时，只允许第一张真出图 ----
+        // 模型在同一轮 tool-calling 中可能连续调用多次（每次都会真实出图，导致"出了三张才返图"）。
+        // 若 120 秒内已出图且 positive 与上次完全一致 → 判定为重复调用，直接返回上次的图，
+        // 要求模型展示即可，不再重复生成。
+        const lg = actionGenerateImageInner.__lastGen;
+        if (lg && Date.now() - lg.time < 120000 && String(positive).trim() === lg.positive) {
+            return JSON.stringify({
+                status: 'done',
+                duplicated: true,
+                images: lg.images,
+                image_url: lg.image_url,
+                markdown: lg.markdown,
+                message: '最近已出图（重复调用），直接展示上图即可，禁止再次调用生成函数。',
+            });
         }
 
         // ---- 质量审查重试循环：出图 → QualityGate 检测 → 不合格换 seed 重出 ----
@@ -906,6 +925,26 @@
             return JSON.stringify(finalRes);
         }
         return JSON.stringify({ status: 'error', message: '出图失败且无可交付结果' });
+    }
+
+    // v6.4 外层包装：记录最近一次成功出图（供熔断判定重复调用），并给返回结果打上
+    // 出图时间戳，供模型判断"本轮是否已出图"。
+    async function actionGenerateImage(args) {
+        const raw = await actionGenerateImageInner(args);
+        try {
+            const obj = JSON.parse(raw);
+            if (obj && obj.status === 'done' && obj.image_url && !obj.duplicated) {
+                const a = args || {};
+                actionGenerateImageInner.__lastGen = {
+                    time: Date.now(),
+                    positive: String(a.positive || '').trim(),
+                    images: obj.images,
+                    image_url: obj.image_url,
+                    markdown: obj.markdown,
+                };
+            }
+        } catch (e) { /* 非 JSON 结果不记录 */ }
+        return raw;
     }
 
     // 从任务 history 读取 SaveText 节点输出的审查 summary
@@ -1183,7 +1222,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
