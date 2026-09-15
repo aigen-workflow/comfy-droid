@@ -317,10 +317,21 @@
         // 下载 → 上传 Comfy input → 工作流走 img2img（denoise<1），保留原图人物与构图。
         let img2imgRef = '';
         const img2imgUrl = String(a.image || '').trim();
+        // v6.6 图生图严格化：
+        //  a) 拒绝把历史出图的 Comfy 输出链接（/view?filename=）当参考图——那是上次生成的结果图，
+        //     不是用户消息附带的原图；拿它当参考必然导致"脸/皮肤对不上原角色"。
+        //  b) 用户要求修改上图（image 非空）但参考图下载/上传失败 → 直接报错，绝不静默回退文生图
+        //     （文生图会整个重画角色，正是"角色被改"的根源）。
         if (img2imgUrl && settings.comfy_endpoint) {
+            if (/\/view\?/.test(img2imgUrl) && /filename=/.test(img2imgUrl)) {
+                return JSON.stringify({
+                    error: 'image 参数是历史出图的 Comfy 输出链接（/view?filename=），不是用户消息附带的图片。请使用用户消息中图片的 URL（[最近用户图片URL] 提示里给出的那个），修正后重新调用。',
+                });
+            }
             try {
                 const base0 = String(settings.comfy_endpoint).replace(/\/+$/, '');
                 const imgResp = await fetch(img2imgUrl);
+                if (!imgResp.ok) throw new Error('HTTP ' + imgResp.status);
                 const imgBlob = await imgResp.blob();
                 const srcName = 'img2img_' + Date.now() + '.png';
                 const fd = new FormData();
@@ -329,10 +340,19 @@
                 const upJson = await upResp.json();
                 img2imgRef = (upJson && upJson.name) || srcName;
             } catch (e) {
-                console.warn('[ComfyDroid] 参考图下载/上传失败，回退文生图：' + e.message);
+                console.warn('[ComfyDroid] 参考图下载/上传失败：' + e.message);
+                return JSON.stringify({
+                    error: '参考图下载/上传失败（' + e.message + '）。本次是基于已有图片的修改，必须拿到正确的用户附图 URL 才能保角色。请用用户消息中图片的 URL（[最近用户图片URL] 提示里给出的那个），修正后重新调用。',
+                });
             }
         }
 
+        // v6.6 图生图身份锁定：img2img 时无条件追加身份保留词，双保险防"脸/皮肤被改"。
+        if (img2imgRef) {
+            positive = String(positive || '') + ', same person, same face, same facial features, same skin tone, same skin color, same hairstyle, keep original identity, keep original appearance, unchanged character, identical face';
+            const idNeg = 'different person, changed face, changed skin tone, different skin color, altered appearance, new character, another person, different person, face swap';
+            negative = String(negative || '') + (negative ? ', ' : '') + idNeg;
+        }
         // ---- 多头/鬼影脸负面词（无条件注入，任何场景都防"多头"） ----
         // 多头是 SD 多人/姿势图最常见畸形：模型在人物旁边多画一个头/脸。
         // 该组词对单人/双人/姿势/多人场景均无副作用，始终追加。
@@ -539,7 +559,7 @@
                     cfg: cfg,
                     sampler_name: samplerName,
                     scheduler: schedulerName,
-                    denoise: img2imgRef ? 0.55 : 1,
+                    denoise: img2imgRef ? 0.45 : 1,
                     model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
@@ -1276,19 +1296,37 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【严禁】使用历史出图的 /view?filename= 链接作为 image——那是上次生成的结果图、不是用户附图，用它换装必然导致脸/皮肤与用户原图不一致；image 必须使用[最近用户图片URL]提示中给出的地址。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。';
 
     function injectDrawingHint(msgText) {
         // v6.5：记录用户消息到达时间 → 刷新出图熔断窗口（新消息允许重新出图）
         lastUserMsgAt = Date.now();
         if (!settings.inject_prompt) return msgText;
-        if (!msgText || !DRAW_KEYWORDS.test(msgText)) return msgText;
+        if (!msgText) return msgText;
+        const hasDrawIntent = DRAW_KEYWORDS.test(msgText);
+        // v6.6：换装/修改类短句（"换一身…衣服/改…/修改上图"等）不含"画/图/生成"关键词，
+        // 也必须注入 imgHint，否则模型拿不到用户附图 URL，只能从历史里抓错的参考图。
+        const hasModifyIntent = /换|改|修|变|衣服|服装|着装|衣|装|上图|这张|那图|原图|重绘|修改|换装|穿着/i.test(msgText);
+        if (!hasDrawIntent && !hasModifyIntent) return msgText;
         // v6.5 图生图：若上下文存在最近用户图片 URL，注入给模型（改上图时必须传 image）
-        const lastImgUrl = findLastUserImageUrl();
+        // v6.6 优先从当前消息文本提取附图 URL（chat 数组可能尚未包含本条消息）；
+        // 取不到再回退 chat 历史。优先顺序保证注入的是"用户本轮附图"，而非历史图。
+        let lastImgUrl = findImageUrlInText(msgText);
+        if (!lastImgUrl) lastImgUrl = findLastUserImageUrl();
         const imgHint = lastImgUrl
-            ? '\n[最近用户图片URL] ' + lastImgUrl + ' —— 若用户要求"修改/换装/重绘上图"，必须把此 URL 传给 comfy_generate_image 的 image 参数。'
+            ? '\n[最近用户图片URL] ' + lastImgUrl + ' —— 若用户要求"修改/换装/重绘上图"，必须把此 URL 传给 comfy_generate_image 的 image 参数；严禁使用历史出图的 /view?filename= 链接（那是上次生成的结果图，不是用户附图）。'
             : '';
         return msgText + INJECT_TEXT + imgHint;
+    }
+
+    // 从一条消息文本中提取图片 URL（markdown 图片链接或裸 http(s) 图片地址）
+    function findImageUrlInText(text) {
+        if (!text) return '';
+        const mRe = text.match(/!\[[^\]]*\]\(([^)]+)\)/);
+        if (mRe && /^https?:\/\//.test(mRe[1])) return mRe[1];
+        const bareRe = text.match(/https?:\/\/[^\s"<>)]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s"<>)]*)?/i);
+        if (bareRe) return bareRe[0];
+        return '';
     }
 
     // 从对话上下文提取最近一张用户图片的 URL（markdown 图片链接或 ST 附件字段）
