@@ -181,13 +181,12 @@
     // 最近一次生成的工作流 JSON（供 submit 缺省参数时兜底使用）
     let lastWorkflowJson = '';
 
-    // ---- v6.5 用户消息周期级出图熔断状态 ----
-    // lastUserMsgAt：最近一次用户消息到达时间（injectDrawingHint 里刷新）。
-    // lastGenAt / lgImageUrl / lgImages / lgMarkdown：最近一次成功出图的信息。
-    // 语义：一条用户消息（lastUserMsgAt 刷新后）只允许真出图一张；第一张成功后
-    // （lastGenAt >= lastUserMsgAt）模型再调生成函数 → 直接返回已出图，不再生成。
-    let lastUserMsgAt = 0;
-    let lastGenAt = 0;
+    // ---- v6.7 用户消息签名级出图熔断状态 ----
+    // lastGenUserSig：最近一次成功出图时对话里最后一条用户消息的签名。
+    // lgImageUrl / lgImages / lgMarkdown：最近一次成功出图的信息。
+    // 语义：同一签名（同一用户消息周期）只允许真出图一张；用户发新消息 → 签名变化
+    // → 自动解除熔断，允许基于上一张图二次修改/换装。
+    let lastGenUserSig = '';
     let lgImageUrl = '';
     let lgImages = [];
     let lgMarkdown = '';
@@ -317,15 +316,18 @@
         // 下载 → 上传 Comfy input → 工作流走 img2img（denoise<1），保留原图人物与构图。
         let img2imgRef = '';
         const img2imgUrl = String(a.image || '').trim();
-        // v6.6 图生图严格化：
-        //  a) 拒绝把历史出图的 Comfy 输出链接（/view?filename=）当参考图——那是上次生成的结果图，
-        //     不是用户消息附带的原图；拿它当参考必然导致"脸/皮肤对不上原角色"。
-        //  b) 用户要求修改上图（image 非空）但参考图下载/上传失败 → 直接报错，绝不静默回退文生图
-        //     （文生图会整个重画角色，正是"角色被改"的根源）。
+        // v6.7 图生图严格化（条件式）：
+        //  a) 用户本轮消息**自带图片**（有附图）→ 必须以附图 URL 为参考图；
+        //     若模型仍传历史出图的 /view?filename= 链接 → 拒绝（那是上次生成的结果图，
+        //     不是用户附图，拿它当参考必然导致脸/皮肤与用户原图不一致）。
+        //  b) 用户本轮**无附图**且引用"上一张/上面生成的那张图" → /view?filename= 是
+        //     合法的二次修改参考图（上一张生成结果），放行。
+        //  c) 参考图下载/上传失败 → 报错，绝不静默回退文生图（文生图会整个重画角色）。
         if (img2imgUrl && settings.comfy_endpoint) {
-            if (/\/view\?/.test(img2imgUrl) && /filename=/.test(img2imgUrl)) {
+            const isViewLink = /\/view\?/.test(img2imgUrl) && /filename=/.test(img2imgUrl);
+            if (isViewLink && lastUserMsgHasImage()) {
                 return JSON.stringify({
-                    error: 'image 参数是历史出图的 Comfy 输出链接（/view?filename=），不是用户消息附带的图片。请使用用户消息中图片的 URL（[最近用户图片URL] 提示里给出的那个），修正后重新调用。',
+                    error: 'image 参数是历史出图的 Comfy 输出链接（/view?filename=），但用户本轮消息附带了图片。请使用用户消息中图片的 URL（[最近用户图片URL] 提示里给出的那个），修正后重新调用。',
                 });
             }
             try {
@@ -342,7 +344,7 @@
             } catch (e) {
                 console.warn('[ComfyDroid] 参考图下载/上传失败：' + e.message);
                 return JSON.stringify({
-                    error: '参考图下载/上传失败（' + e.message + '）。本次是基于已有图片的修改，必须拿到正确的用户附图 URL 才能保角色。请用用户消息中图片的 URL（[最近用户图片URL] 提示里给出的那个），修正后重新调用。',
+                    error: '参考图下载/上传失败（' + e.message + '）。本次是基于已有图片的修改，必须拿到正确的参考图 URL 才能保角色。请检查 image 参数（用户附图或上一张生成图 URL），修正后重新调用。',
                 });
             }
         }
@@ -830,6 +832,48 @@
         return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
+    // ---- v6.7 用户消息签名级出图熔断 ----
+    // v6.5/v6.6 按"时间戳"熔断（lastUserMsgAt 由 setMessageFormatting 回调刷新），
+    // 但在 SillyDroid 里该回调可能不触发 → 用户发新修改消息时间戳不刷新 → 新请求被
+    // 误判为"同一周期"直接返回旧图，导致"不能二次修改"。v6.7 改为**消息签名**：
+    // 出图时记录当时对话里最后一条用户消息的签名；工具调用时实时读当前签名，
+    // 相同 → 同一消息周期重复调用 → 熔断返回已出图；不同 → 用户发了新消息 → 放行。
+    function getLastUserMsgSig() {
+        try {
+            const ctx = SillyTavern.getContext();
+            const chat = (ctx && ctx.chat) || [];
+            for (let i = chat.length - 1; i >= 0; i--) {
+                const m = chat[i];
+                if (m && m.is_user) {
+                    const id = m.id || m.mesId || '';
+                    const ts = m.timestamp || m.date || '';
+                    const txt = String(m.message || '').slice(0, 60);
+                    return id + '|' + ts + '|' + txt;
+                }
+            }
+        } catch (e) { /* 读不到签名则返回空，熔断失效（保守放行） */ }
+        return '';
+    }
+
+    // 当前对话中最后一条用户消息是否自带图片（决定是否拒绝 /view?filename= 参考图）
+    function lastUserMsgHasImage() {
+        try {
+            const ctx = SillyTavern.getContext();
+            const chat = (ctx && ctx.chat) || [];
+            for (let i = chat.length - 1; i >= 0; i--) {
+                const m = chat[i];
+                if (m && m.is_user) {
+                    const md = String(m.message || '');
+                    if (findImageUrlInText(md)) return true;
+                    const extraImg = (m.extra && (m.extra.image || (Array.isArray(m.extra.images) && m.extra.images[0]))) || '';
+                    if (extraImg) return true;
+                    return false;
+                }
+            }
+        } catch (e) { /* 忽略 */ }
+        return false;
+    }
+
     async function actionGenerateImageInner(args) {
         const a = args || {};
         if (!settings.comfy_endpoint) {
@@ -843,21 +887,16 @@
             return JSON.stringify({ error: '缺少正向提示词 positive' });
         }
 
-        // ---- v6.5 用户消息周期级熔断：一条用户消息只允许真出图一张 ----
-        // 旧版按"120秒+提示词完全相同"熔断，但模型每次调用都会重写提示词（哪怕语义一致），
-        // 熔断永远不触发 → "一次生出好多张"。正确语义：
-        //   - 用户发新消息时 lastUserMsgAt 被刷新 → 熔断解除，允许出第一张；
-        //   - 第一张出图成功（lastGenAt 更新）后，同一用户消息周期内模型再调生成函数
-        //     → 直接返回已出图的图，禁止重复生成。
-        // 新用户消息（lastUserMsgAt > lastGenAt）→ 熔断自动失效，允许重新生成。
-        if (lastGenAt >= lastUserMsgAt && lgImageUrl) {
+        // ---- v6.7 消息签名级熔断 ----
+        const curSig = getLastUserMsgSig();
+        if (curSig && lastGenUserSig && curSig === lastGenUserSig && lgImageUrl) {
             return JSON.stringify({
                 status: 'done',
                 duplicated: true,
                 images: lgImages,
                 image_url: lgImageUrl,
                 markdown: lgMarkdown,
-                message: '本条消息已出过图（出图熔断），直接展示上图即可，禁止再次调用生成函数。',
+                message: '本条用户消息已出过图（出图熔断），直接展示上图即可，禁止再次调用生成函数。',
             });
         }
 
@@ -990,14 +1029,13 @@
         return JSON.stringify({ status: 'error', message: '出图失败且无可交付结果' });
     }
 
-    // v6.5 外层包装：记录最近一次成功出图（供用户消息周期级熔断判定），
-    // 并给返回结果打上出图时间戳，供模型判断"本轮是否已出图"。
+    // v6.7 外层包装：记录最近一次成功出图（签名 + 图信息，供消息签名级熔断判定）
     async function actionGenerateImage(args) {
         const raw = await actionGenerateImageInner(args);
         try {
             const obj = JSON.parse(raw);
             if (obj && obj.status === 'done' && obj.image_url && !obj.duplicated) {
-                lastGenAt = Date.now();
+                lastGenUserSig = getLastUserMsgSig();
                 lgImageUrl = obj.image_url;
                 lgImages = obj.images || [];
                 lgMarkdown = obj.markdown || '![image](' + obj.image_url + ')';
@@ -1296,11 +1334,9 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【严禁】使用历史出图的 /view?filename= 链接作为 image——那是上次生成的结果图、不是用户附图，用它换装必然导致脸/皮肤与用户原图不一致；image 必须使用[最近用户图片URL]提示中给出的地址。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【参考图选择规则】①用户本轮消息附带了图片 → image 必须用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。';
 
     function injectDrawingHint(msgText) {
-        // v6.5：记录用户消息到达时间 → 刷新出图熔断窗口（新消息允许重新出图）
-        lastUserMsgAt = Date.now();
         if (!settings.inject_prompt) return msgText;
         if (!msgText) return msgText;
         const hasDrawIntent = DRAW_KEYWORDS.test(msgText);
@@ -1314,8 +1350,10 @@
         let lastImgUrl = findImageUrlInText(msgText);
         if (!lastImgUrl) lastImgUrl = findLastUserImageUrl();
         const imgHint = lastImgUrl
-            ? '\n[最近用户图片URL] ' + lastImgUrl + ' —— 若用户要求"修改/换装/重绘上图"，必须把此 URL 传给 comfy_generate_image 的 image 参数；严禁使用历史出图的 /view?filename= 链接（那是上次生成的结果图，不是用户附图）。'
-            : '';
+            ? '\n[最近用户图片URL] ' + lastImgUrl + ' —— 用户本轮消息附带的图片。若用户要求"修改/换装/重绘上图"，必须把此 URL 传给 comfy_generate_image 的 image 参数；严禁使用历史出图的 /view?filename= 链接（那是上次生成的结果图，不是用户附图）。'
+            : (lgImageUrl
+                ? '\n[上一张出图URL] ' + lgImageUrl + ' —— 上一张生成结果图。若用户没有附图、但要求"把上一张/刚才生成的那张图再修改/再换装"，可把此 URL 传给 comfy_generate_image 的 image 参数做二次修改（这是合法的二次修改参考图）。'
+                : '');
         return msgText + INJECT_TEXT + imgHint;
     }
 
