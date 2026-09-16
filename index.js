@@ -72,12 +72,18 @@
         lora_trigger: 'XH_EA_FACE',  // LoRA 触发词（自动注入 positive 开头）
         sdxl_sampler: 'dpmpp_2m_sde',// SDXL 推荐采样器
         sdxl_scheduler: 'karras',    // SDXL 推荐调度器
-        sdxl_steps: 26,              // SDXL 步数（v6.3d 提速：30→26，质量损失可忽略）
+        sdxl_steps: 22,              // SDXL 步数（v7.8 提速：26→22，Juggernaut 质量损失极小，单张省 3~4s）
         sdxl_cfg: 4.0,               // SDXL CFG（v6.3d 提速：4.5→4.0，Juggernaut 3-6 区间内）
         sdxl_width: 832,             // SDXL 竖图推荐宽度
         sdxl_height: 1216,           // SDXL 竖图推荐高度
         hires_scale: 1.25,           // Hires Fix 放大倍率（v6.3d 提速：1.5x→1.25x，时间省约 40%）
         hires_denoise: 0.35,         // Hires Fix 二次采样强度（v6.3d 提速：0.4→0.35）
+        // v7.8 漫画批量提速档：16 格时用更省时的参数（质量优先时用户可调回上面常规档）
+        comic_fast_steps: 20,        // 漫画分镜步数（比单张再降 2 步）
+        comic_fast_hires_scale: 1.15,// 漫画分镜 hires 倍率（比单张再降）
+        comic_fast_hires_denoise: 0.3, // 漫画分镜 hires 强度
+        comic_char_lock: true,       // v7.8 漫画角色锁定：第1格成功后，后续格自动以第1格图为 img2img 参考锁角色（denoise 0.55）
+        comic_char_lock_denoise: 0.55, // 漫画角色锁定 img2img 强度（越高越自由、越低越像首格；0.5~0.6 平衡）
         comic_mode: false,           // v7.0 漫画模式：真实画风连续剧情分镜（count 默认4，每张一个场景/动作）
         comic_count: 4,              // v7.0 漫画模式默认分镜数（1~4）
         character_ref: '',           // v7.0 角色参考图 URL（用户上传/三视图选中后锁定；后续漫画生成自动作 img2img 参考）
@@ -213,8 +219,8 @@
                     negative: { type: 'string', description: '反向负面提示词，畸形、水印、低画质等' },
                     image: { type: 'string', description: '（可选）参考图 URL。当用户要求"修改/换装/换衣服/重绘/改上图/上面这张图"等基于已有图片的修改时，必须传用户消息中图片的 URL；扩展自动走图生图（img2img），保留原图人物与构图，只按 positive 改衣服等部分。纯新图生成不传此参数。' },
                     pose_file: { type: 'string', description: '（可选）姿势图库文件名。复杂双人动作必填：cowgirl_01.png=女上位跨坐、missionary_01~52.png=男上正面、oral_01~06.png=跪姿/口部特写、closeup_01~03.png=脸/上半身特写、from_behind_03~04.png=背后双人(双女慎用)、throne_pose.jpg=王座式、lift_pose.jpg=仰卧托举、backbend_lift.jpg=站立托举后仰、ballroom_dance.jpg=交谊舞牵手、piggyback.jpg=背背。选最接近用户动作的一张' },
-                    count: { type: 'integer', description: '（可选）一次生成几张，默认1，最大4。仅当用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。' },
-                    frames: { type: 'array', items: { type: 'string' }, description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。' },
+                    count: { type: 'integer', description: '（可选）一次生成几张，默认1，普通最多4；漫画/分镜时最多16（配合 frames 使用）。仅当用户明确要求"生成N张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。' },
+                    frames: { type: 'array', items: { type: 'string' }, description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤16，一格=一个场景+动作+情绪；用户要"4张漫画页每张4格"=拆16格），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。【一格一画面】每格只能描述一个画面，禁止写 comic page/2x2/panel 等排版词；每4格扩展自动拼成一张2x2漫画页。' },
                     captions: { type: 'array', items: { type: 'string' }, description: '（可选·漫画配文专用）中文配文数组，与 frames 一一对应：每格一句中文（该格的对白/旁白/剧情说明，供展示在图片下方）。必须用中文写；只有 frames 里的提示词用英文。不传则无配文。' },
                     view: { type: 'string', description: '（可选）角色设定视图：front=正面、side=侧面、back=背面。用户要求"角色三视图/设定图/正侧面"时，一次调用传 count=3 并分别用 front/side/back 生成三张（角色着衣全身设定图，用于锁定角色外貌）；不用此参数时省略。' },
                     width: { type: 'integer', description: '图片宽度，默认896' },
@@ -313,9 +319,12 @@
         // 会破坏 SDXL 参数档（Lightning 需 cfg 3-6、steps 26）。SDXL 档一律忽略模型传参，
         // 只接收 positive/negative/pose_file；SD1.5 档保持模型传参优先。
         const useSdxl = settings.use_sdxl !== false;
-        const width = useSdxl ? settings.sdxl_width : (a.width || settings.width);
-        const height = useSdxl ? settings.sdxl_height : (a.height || settings.height);
-        const steps = useSdxl ? settings.sdxl_steps : (a.steps || settings.steps);
+        // v7.8 漫画批量提速档：漫画分镜/多格时用省时参数（16 格批量总时长明显下降），
+        // 常规单张仍用完整参数档保质量。
+        const isBatchFast = settings.comic_mode || Array.isArray(a.frames) || /漫画|分镜|连环|剧情画面|连续画面|四张漫画|多格/i.test(String(getLastUserMsgText()));
+        const width = useSdxl ? (isBatchFast && settings.comic_fast_width ? settings.comic_fast_width : settings.sdxl_width) : (a.width || settings.width);
+        const height = useSdxl ? (isBatchFast && settings.comic_fast_height ? settings.comic_fast_height : settings.sdxl_height) : (a.height || settings.height);
+        const steps = useSdxl ? (isBatchFast ? (settings.comic_fast_steps || settings.sdxl_steps) : settings.sdxl_steps) : (a.steps || settings.steps);
         const cfg = useSdxl ? settings.sdxl_cfg : (a.cfg !== undefined && a.cfg !== null ? a.cfg : settings.cfg);
         const samplerName = useSdxl ? (settings.sdxl_sampler || 'dpmpp_2m_sde') : settings.sampler_name;
         const schedulerName = useSdxl ? (settings.sdxl_scheduler || 'karras') : settings.scheduler;
@@ -618,7 +627,7 @@
                     cfg: cfg,
                     sampler_name: samplerName,
                     scheduler: schedulerName,
-                    denoise: img2imgRef ? 0.45 : 1,
+                    denoise: a.img2img_denoise !== undefined && a.img2img_denoise !== null ? a.img2img_denoise : (img2imgRef ? 0.45 : 1),
                     model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
@@ -684,7 +693,9 @@
         // 手部/脸部细节像素翻倍，解决全身构图小图模糊。默认开；设置里可关。
         const hires = settings.hires_fix !== false;
         if (hires) {
-            const hiresScale = settings.hires_scale || 1.25;
+            // v7.8 漫画批量时用加速 hires 档（倍率/强度更低，16 格总时长省 15~20%）
+            const hiresScale = isBatchFast && settings.comic_fast_hires_scale ? settings.comic_fast_hires_scale : (settings.hires_scale || 1.25);
+            const hiresDenoise = isBatchFast && settings.comic_fast_hires_denoise !== undefined ? settings.comic_fast_hires_denoise : (settings.hires_denoise !== undefined ? settings.hires_denoise : 0.35);
             const hw = Math.round(width * hiresScale / 2) * 2;
             const hh = Math.round(height * hiresScale / 2) * 2;
             workflow['8a'] = {
@@ -703,7 +714,7 @@
                     cfg: cfg,
                     sampler_name: samplerName,
                     scheduler: schedulerName,
-                    denoise: settings.hires_denoise !== undefined ? settings.hires_denoise : 0.35,
+                    denoise: hiresDenoise,
                     model: modelRef,
                     positive: ['6', 0],
                     negative: ['7', 0],
@@ -936,12 +947,19 @@
 
     // ---- v7.7 主角性别锚定：从第 1 格 frames 提取主角性别词，供后续格硬注入 ----
     // 解决"第一格男性、后格画成女性"的角色漂移。提取失败返回 ''（不注入，不误伤多角色格）。
-    function inferProtagonistGender(frameText) {
+    // v7.8 增强：frames 无性别词时，从用户剧情/消息中文回退提取（他/男/男人/男孩 vs 她/女/女孩）。
+    function inferProtagonistGender(frameText, userText) {
         const t = String(frameText || '');
         const male = /(^|[^a-z])(male|man|men|boy|guy|him|his|he)([^a-z]|$)/i;
         const female = /(^|[^a-z])(female|woman|women|girl|her|hers|she)([^a-z]|$)/i;
         if (male.test(t) && !female.test(t)) return '1 adult male protagonist, male face, short hair, flat chest, masculine body';
         if (female.test(t) && !male.test(t)) return '1 adult female protagonist, female face, feminine body';
+        // 中文回退：从用户剧情判断主角性别（只取明确信号）
+        const u = String(userText || '');
+        const cnMale = /(他|男|男人|男孩|小伙子|少年|帅哥|靓仔)/.test(u);
+        const cnFemale = /(她|女|女人|女孩|姑娘|少女|美女)/.test(u);
+        if (cnMale && !cnFemale) return '1 adult male protagonist, male face, short hair, flat chest, masculine body';
+        if (cnFemale && !cnMale) return '1 adult female protagonist, female face, feminine body';
         return '';
     }
 
@@ -1012,6 +1030,9 @@
         const charConst = String(settings.character_constants || '').trim();
         const allImages = [];
         const allErrors = [];
+        // v7.8 漫画角色锁定：第 1 格成功后，后续格自动以第 1 格图为 img2img 参考（锁脸/锁性别/锁身材）
+        let comicRefImage = '';
+        const comicLock = isComic && !viewMode && settings.comic_char_lock !== false && frames.length > 1;
         for (let i = 0; i < count; i++) {
             let one;
             const oneArgs = Object.assign({}, a);
@@ -1027,11 +1048,18 @@
                 // v7.7 加回角色一致性词（v7.5 误删导致"第一格男、后格变女"）：
                 //   ① 主角身份锁定：same protagonist / same gender / same outfit / consistent character
                 //   ② 性别锚定：从第 1 格提取 male/female 等性别词，硬注入后续每格
-                const protoGender = (i > 0 && frames.length > 1) ? inferProtagonistGender(frames[0]) : '';
+                // v7.8 性别提取失败时回退从用户剧情中文提取；首格成功后自动 img2img 锁角色。
+                const protoGender = (i > 0 && frames.length > 1) ? inferProtagonistGender(frames[0], lastUserMsgText) : '';
                 const frameSeq = (charConst ? charConst + ', ' : '') + framePos
                     + (protoGender ? ', ' + protoGender : '')
                     + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image, same protagonist as scene 1, same gender, same face, same hairstyle, same outfit, consistent character identity across all scenes';
                 oneArgs.positive = frameSeq;
+                // v7.8 漫画角色锁定：i>0 且首格已出 → 以首格图为 img2img 参考锁角色
+                if (comicLock && i > 0 && comicRefImage) {
+                    oneArgs.image = comicRefImage;
+                    oneArgs.img2img_denoise = settings.comic_char_lock_denoise !== undefined ? settings.comic_char_lock_denoise : 0.55;
+                    oneArgs.positive = oneArgs.positive + ', same person as the reference image, identical face, identical gender, identical hairstyle, identical outfit';
+                }
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
                 if (i > 0) oneArgs.positive = (charConst ? charConst + ', ' : '') + framePos + ', variant ' + (i + 1) + ', different composition';
@@ -1045,6 +1073,10 @@
                 // v7.4 中文配文：frames 模式下把 captions[i] 挂到该格第一张图
                 if (frames.length > 0 && Array.isArray(a.captions) && String(a.captions[i] || '').trim()) {
                     try { one.images[0].caption = String(a.captions[i]).trim(); } catch (e) { /* 忽略 */ }
+                }
+                // v7.8 角色锁定：记住首格图 URL（后续格 img2img 参考）
+                if (comicLock && !comicRefImage && one.images[0] && one.images[0].url) {
+                    comicRefImage = one.images[0].url;
                 }
                 allImages.push(...one.images);
             } else if (one && one.error) {
@@ -1170,7 +1202,9 @@
         const a = args || {};
 
         // ---- 质量审查重试循环：出图 → QualityGate 检测 → 不合格换 seed 重出 ----
-        const maxAttempts = Math.max(1, settings.quality_retry || 3);
+        // v7.8 漫画批量时审查重试减负：2 轮（16 格批量下总时长显著下降，失败格交给局部重绘/拼页不阻塞）
+        const isBatchFastNow = settings.comic_mode || Array.isArray(a.frames) || /漫画|分镜|连环|剧情画面|连续画面|四张漫画|多格/i.test(String(getLastUserMsgText()));
+        const maxAttempts = Math.max(1, isBatchFastNow ? Math.min(2, settings.quality_retry || 3) : (settings.quality_retry || 3));
         const gateFailures = [];
         let lastResult = null;
         let lastRepaired = null;  // 记录最后一次局部修复结果（全部失败时优先交付修复版，而非原始畸形图）
@@ -1545,7 +1579,7 @@
             if (!parameters.properties.count) {
                 parameters.properties.count = {
                     type: 'integer',
-                    description: '（可选）一次生成几张，默认1，最大4。仅当用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。',
+                    description: '（可选）一次生成几张，默认1，普通最多4；漫画/分镜时最多16（配合 frames 使用）。仅当用户明确要求"生成N张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。',
                 };
             }
             // v7.2：注入 frames 参数（漫画分镜数组，长剧情拆格）
@@ -1553,7 +1587,7 @@
                 parameters.properties.frames = {
                     type: 'array',
                     items: { type: 'string' },
-                    description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。',
+                    description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤16，一格=一个场景+动作+情绪；用户要"4张漫画页每张4格"=拆16格），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。【一格一画面】每格只能描述一个画面，禁止写 comic page/2x2/panel 等排版词；每4格扩展自动拼成一张2x2漫画页。',
                 };
             }
             // v7.4：注入 captions 参数（中文配文，与 frames 一一对应）
@@ -1633,7 +1667,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。\n[多张生成纪律] 用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/一组图/漫画"时，调用 comfy_generate_image 并传 count=对应张数（最大4），一次调用出全部；用户没要求多张时必须省略 count（默认1张）。禁止用户没要求多张时传 count>1，也禁止同一请求反复调用生成函数（会触发熔断）。多张场景每张可写不同小场景/不同姿势/不同分镜内容，但必须保持用户指定的人物/风格一致。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。\n[多张生成纪律] 用户明确要求"生成N张/多张/几个分镜/一组图/漫画"时，调用 comfy_generate_image 并传 count=对应张数（普通最多4；漫画/分镜配合 frames 时最多16），一次调用出全部；用户没要求多张时必须省略 count（默认1张）。禁止用户没要求多张时传 count>1，也禁止同一请求反复调用生成函数（会触发熔断）。多张场景每张可写不同小场景/不同姿势/不同分镜内容，但必须保持用户指定的人物/风格一致——尤其主角性别/脸/服装全链一致，禁止中途变性。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
@@ -1675,6 +1709,7 @@
                 + '\n① frames 参数（字符串数组）：每格一个**专业英文提示词**（仅供生图，规则见下）；'
                 + '\n② captions 参数（字符串数组，与 frames 一一对应）：每格一句**中文**配文（该格对白/旁白/剧情说明，展示在图片下方）。'
                 + '\n【一格一画面·最高强制】每张图只画一个画面。frames 里**禁止**写 "comic page / 2x2 grid / white gutters / panel layout / comic strip / 4-panel / speech bubbles / text in image" 等任何排版/多格/文字词——那会让模型把很多格子塞进一张图（实测翻车）。分页拼接由扩展自动完成：每 4 格拼成一张 2×2 漫画页。'
+                + '\n【角色锁定·第1格是关键】扩展会自动把第 1 格的画面作为后续所有格的角色参考（锁脸/性别/身材）。因此**第 1 格 frames 必须写清主角完整身份**（性别+年龄+发型+服装+体型，例：a 18yo slim chinese male, short black hair, worn grey t-shirt）；后续每格同样要重复主角身份，禁止主角中途变性/换人。'
                 + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
                 + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
@@ -1801,13 +1836,16 @@
                 <input type="checkbox" id="cd_quality_gate"> 质量审查（出图后自动检测畸形，不合格换 seed 重试，推荐开启）
               </label>
               <label class="checkbox_label" for="cd_use_sdxl">
-                <input type="checkbox" id="cd_use_sdxl"> SDXL 档（Juggernaut XL + 亚洲脸 LoRA：832×1216 / CFG 4.5 / 30步，推荐开启）
+                <input type="checkbox" id="cd_use_sdxl"> SDXL 档（Juggernaut XL + 亚洲脸 LoRA：832×1216 / CFG 4.0 / 22步，推荐开启）
               </label>
               <label class="checkbox_label" for="cd_comic_mode">
-                <input type="checkbox" id="cd_comic_mode"> 漫画模式（真实画风连续剧情分镜：默认一次出4格，每格一个场景/动作，保持同一角色）
+                <input type="checkbox" id="cd_comic_mode"> 漫画模式（真实画风连续剧情分镜：按剧情拆格，每格一个场景/动作，保持同一角色）
               </label>
               <label class="checkbox_label" for="cd_comic_grid">
-                <input type="checkbox" id="cd_comic_grid"> 漫画拼页（分镜生成后自动拼成一张 2x2 漫画页返回；关闭则只返回各格独立图）
+                <input type="checkbox" id="cd_comic_grid"> 漫画拼页（每4格自动拼成一张 2x2 漫画页返回；关闭则只返回各格独立图）
+              </label>
+              <label class="checkbox_label" for="cd_comic_lock">
+                <input type="checkbox" id="cd_comic_lock"> 漫画角色锁定（第1格出图后，后续格自动以第1格为参考锁角色/性别/身材，推荐开启）
               </label>
               <div style="margin-top:8px;">
                 <label for="cd_char_ref">角色参考图 URL（上传角色图后说"用我的角色/设为角色图"自动保存；漫画/换装时用它锁定角色不漂移）</label>
@@ -1875,6 +1913,8 @@
         if (comicModeEl) comicModeEl.checked = !!settings.comic_mode;
         const comicGridEl = document.getElementById('cd_comic_grid');
         if (comicGridEl) comicGridEl.checked = settings.comic_grid !== false;
+        const comicLockEl = document.getElementById('cd_comic_lock');
+        if (comicLockEl) comicLockEl.checked = settings.comic_char_lock !== false;
         setVal('cd_char_ref', settings.character_ref);
         setVal('cd_char_const', settings.character_constants);
 
@@ -1934,6 +1974,12 @@
         if (comicGridEl) {
             comicGridEl.addEventListener('change', () => {
                 settings.comic_grid = comicGridEl.checked;
+                saveSettingsDebounced();
+            });
+        }
+        if (comicLockEl) {
+            comicLockEl.addEventListener('change', () => {
+                settings.comic_char_lock = comicLockEl.checked;
                 saveSettingsDebounced();
             });
         }
