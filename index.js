@@ -1031,7 +1031,8 @@
         const allImages = [];
         const allErrors = [];
         // v7.8 漫画角色锁定：第 1 格成功后，后续格自动以第 1 格图为 img2img 参考（锁脸/锁性别/锁身材）
-        let comicRefImage = '';
+        // v7.9 升级为"同性别格互锁"：male/female 分开记录最近参考图，避免第 1 格是女时把男格锁成女。
+        const genderRefMap = {};
         const comicLock = isComic && !viewMode && settings.comic_char_lock !== false && frames.length > 1;
         for (let i = 0; i < count; i++) {
             let one;
@@ -1049,14 +1050,34 @@
                 //   ① 主角身份锁定：same protagonist / same gender / same outfit / consistent character
                 //   ② 性别锚定：从第 1 格提取 male/female 等性别词，硬注入后续每格
                 // v7.8 性别提取失败时回退从用户剧情中文提取；首格成功后自动 img2img 锁角色。
-                const protoGender = (i > 0 && frames.length > 1) ? inferProtagonistGender(frames[0], lastUserMsgText) : '';
+                // v7.8 修复：lastUserMsgText 定义在 actionBuildWorkflow 内部，此处作用域不可见，
+                // 用 getLastUserMsgText() 直接取（此前 ReferenceError: lastUserMsgText is not defined
+                // 导致 frames 漫画调用整个失败 → 不返图）。try/catch 兜底：性别提取失败只丢锚，不炸批。
+                // v7.9 修复"男变女"关键：锚定逻辑改为【该格自身性别词优先，无则回退第1格主角性别】。
+                // 旧逻辑永远用 frames[0] 的性别锚注入所有格——若第1格是女生宿舍，后面杨峰(男)的格
+                // 也被硬注入 female，SD 就会把男角色画成女的。
+                let protoGender = '';
+                try {
+                    const thisGender = inferProtagonistGender(frames[i], getLastUserMsgText());
+                    const firstGender = i > 0 ? inferProtagonistGender(frames[0], getLastUserMsgText()) : '';
+                    protoGender = thisGender || firstGender;
+                } catch (e) { protoGender = ''; }
+                // v7.9 该格性别标签：用于"同性别格互锁"（male 格参考最近的 male 图，female 参考 female 图）。
+                const genderTag = /male/.test(protoGender) ? 'male' : (/female/.test(protoGender) ? 'female' : '');
+                // v7.9 一致性词跟随该格性别：male 格锁"与前段男角色一致"、female 格锁"与前段女角色一致"。
+                // 旧版写死 "same protagonist as scene 1"——多角色剧情里杨峰(男)格被迫与李思潼(女)一致 → 男变女。
+                let identityLock = ', consistent character identity across all scenes';
+                if (genderTag === 'male') identityLock = ', same male protagonist as previous male scenes, same male face, same short hairstyle, same outfit, consistent male identity across all scenes';
+                else if (genderTag === 'female') identityLock = ', same female protagonist as previous female scenes, same female face, same hairstyle, same outfit, consistent female identity across all scenes';
                 const frameSeq = (charConst ? charConst + ', ' : '') + framePos
                     + (protoGender ? ', ' + protoGender : '')
-                    + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image, same protagonist as scene 1, same gender, same face, same hairstyle, same outfit, consistent character identity across all scenes';
+                    + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image' + identityLock;
                 oneArgs.positive = frameSeq;
-                // v7.8 漫画角色锁定：i>0 且首格已出 → 以首格图为 img2img 参考锁角色
-                if (comicLock && i > 0 && comicRefImage) {
-                    oneArgs.image = comicRefImage;
+                // v7.8/v7.9 漫画角色锁定：i>0 且有同性别参考图时，以最近同性别格图为 img2img 参考锁角色。
+                // 【关键修复】旧版永远锁第1格图——第1格是女生时会把后面男角色也锁成女生（男变女）。
+                // 现在 male 格锁最近的 male 图、female 格锁最近的 female 图；无同性别参考则不强锁（靠提示词锚）。
+                if (comicLock && i > 0 && genderTag && genderRefMap[genderTag]) {
+                    oneArgs.image = genderRefMap[genderTag];
                     oneArgs.img2img_denoise = settings.comic_char_lock_denoise !== undefined ? settings.comic_char_lock_denoise : 0.55;
                     oneArgs.positive = oneArgs.positive + ', same person as the reference image, identical face, identical gender, identical hairstyle, identical outfit';
                 }
@@ -1074,9 +1095,14 @@
                 if (frames.length > 0 && Array.isArray(a.captions) && String(a.captions[i] || '').trim()) {
                     try { one.images[0].caption = String(a.captions[i]).trim(); } catch (e) { /* 忽略 */ }
                 }
-                // v7.8 角色锁定：记住首格图 URL（后续格 img2img 参考）
-                if (comicLock && !comicRefImage && one.images[0] && one.images[0].url) {
-                    comicRefImage = one.images[0].url;
+                // v7.9 角色锁定：按该格性别记录最近参考图（male/female 分开；无性别标签的格不记录，
+                // 避免"宿舍女生格"污染后面男角色格）。该格实际用过的锚才记录。
+                if (comicLock && one.images[0] && one.images[0].url) {
+                    try {
+                        const g = inferProtagonistGender(frames[i] || '', getLastUserMsgText());
+                        const tag = /male/.test(g) ? 'male' : (/female/.test(g) ? 'female' : '');
+                        if (tag) genderRefMap[tag] = one.images[0].url;
+                    } catch (e) { /* 忽略 */ }
                 }
                 allImages.push(...one.images);
             } else if (one && one.error) {
