@@ -207,6 +207,7 @@
                     negative: { type: 'string', description: '反向负面提示词，畸形、水印、低画质等' },
                     image: { type: 'string', description: '（可选）参考图 URL。当用户要求"修改/换装/换衣服/重绘/改上图/上面这张图"等基于已有图片的修改时，必须传用户消息中图片的 URL；扩展自动走图生图（img2img），保留原图人物与构图，只按 positive 改衣服等部分。纯新图生成不传此参数。' },
                     pose_file: { type: 'string', description: '（可选）姿势图库文件名。复杂双人动作必填：cowgirl_01.png=女上位跨坐、missionary_01~52.png=男上正面、oral_01~06.png=跪姿/口部特写、closeup_01~03.png=脸/上半身特写、from_behind_03~04.png=背后双人(双女慎用)、throne_pose.jpg=王座式、lift_pose.jpg=仰卧托举、backbend_lift.jpg=站立托举后仰、ballroom_dance.jpg=交谊舞牵手、piggyback.jpg=背背。选最接近用户动作的一张' },
+                    count: { type: 'integer', description: '（可选）一次生成几张，默认1，最大3。仅当用户明确要求"生成N张/两张/三张/多张/几个分镜"时传对应数字；用户没要求多张时必须省略或传1。' },
                     width: { type: 'integer', description: '图片宽度，默认896' },
                     height: { type: 'integer', description: '图片高度，默认1152' },
                     steps: { type: 'integer', description: '采样步数，默认28' },
@@ -899,6 +900,11 @@
         return false;
     }
 
+    // ---- v6.9 多张生成入口 ----
+    // 用户明确要求"生成N张/几张图/多张/分镜"时，模型传 count=N（1~3）。
+    // 一次工具调用内逐张生成（每张独立 seed + 独立质量审查链），收集全部结果返回。
+    // 熔断只在外层判定一次：同一用户消息签名下只允许"一次成功的多张调用"，
+    // 之后再调 → 返回已生成的全部图。这样既支持按指令多张，又防模型重复调用刷图。
     async function actionGenerateImageInner(args) {
         const a = args || {};
         if (!settings.comfy_endpoint) {
@@ -912,7 +918,7 @@
             return JSON.stringify({ error: '缺少正向提示词 positive' });
         }
 
-        // ---- v6.7 消息签名级熔断 ----
+        // ---- v6.7 消息签名级熔断（外层判定一次）----
         const curSig = getLastUserMsgSig();
         if (curSig && lastGenUserSig && curSig === lastGenUserSig && lgImageUrl) {
             return JSON.stringify({
@@ -924,6 +930,53 @@
                 message: '本条用户消息已出过图（出图熔断），直接展示上图即可，禁止再次调用生成函数。',
             });
         }
+
+        // ---- v6.9 张数解析：count=N（1~3），默认1 ----
+        let count = parseInt(a.count, 10);
+        if (!count || isNaN(count)) count = 1;
+        count = Math.max(1, Math.min(3, count));
+
+        if (count <= 1) {
+            return generateOneImage(a);
+        }
+
+        // 多张：逐张生成（每张独立 seed、独立审查），收集全部结果
+        const allImages = [];
+        const allErrors = [];
+        for (let i = 0; i < count; i++) {
+            let one;
+            try {
+                one = JSON.parse(await generateOneImage(a));
+            } catch (e) {
+                one = { status: 'error', message: String(e) };
+            }
+            if (one && one.status === 'done' && Array.isArray(one.images) && one.images.length) {
+                allImages.push(...one.images);
+            } else if (one && one.error) {
+                allErrors.push(String(one.error).slice(0, 150));
+            } else {
+                allErrors.push(String((one && one.message) || ('第' + (i + 1) + '张生成失败')).slice(0, 150));
+            }
+        }
+        if (!allImages.length) {
+            return JSON.stringify({ status: 'error', message: '多张生成全部失败：' + allErrors.join(' | ') });
+        }
+        const markdown = allImages.map((im) => '![image](' + im.url + ')').join('\n');
+        const res = {
+            status: 'done',
+            count: allImages.length,
+            images: allImages,
+            image_url: allImages[0].url,
+            markdown: markdown,
+        };
+        if (allErrors.length) res.partial_errors = allErrors.join(' | ');
+        return JSON.stringify(res);
+    }
+
+    // 单张生成全流程（工作流→提交→轮询→质量审查→局部修复）。每张独立调用，
+    // seed 在 actionBuildWorkflow 内随机，多张循环天然得到不同构图。
+    async function generateOneImage(args) {
+        const a = args || {};
 
         // ---- 质量审查重试循环：出图 → QualityGate 检测 → 不合格换 seed 重出 ----
         const maxAttempts = Math.max(1, settings.quality_retry || 3);
@@ -1297,6 +1350,13 @@
                     description: '（可选）参考图 URL。当用户要求"修改/换装/换衣服/重绘/改上图/上面这张图/把上图..."等基于已有图片的修改时，必须传用户消息中图片的 URL；扩展自动走图生图（img2img）保留原图人物与构图，只按 positive 改衣服等部分。纯新图生成不传此参数。',
                 };
             }
+            // v6.9：注入 count 参数（多张生成）。仅当用户明确要求"N张/多张/分镜"时才用。
+            if (!parameters.properties.count) {
+                parameters.properties.count = {
+                    type: 'integer',
+                    description: '（可选）一次生成几张，默认1，最大3。仅当用户明确要求"生成N张/两张/三张/多张/几个分镜"时传对应数字；用户没要求多张时必须省略或传1。',
+                };
+            }
             if (!parameters.required) parameters.required = ['positive'];
         }
         return {
@@ -1359,7 +1419,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。\n[多张生成纪律] 用户明确要求"生成N张/两张/三张/多张/几个分镜/一组图"时，调用 comfy_generate_image 并传 count=对应张数（最大3），一次调用出全部；用户没要求多张时必须省略 count（默认1张）。禁止用户没要求多张时传 count>1，也禁止同一请求反复调用生成函数（会触发熔断）。多张场景每张可写不同小场景/不同姿势/不同分镜内容，但必须保持用户指定的人物/风格一致。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
