@@ -1081,7 +1081,7 @@
             status: 'done',
             count: allImages.length,
             images: outImages,
-            image_url: (gridImage || outImages[0]).url,
+            image_url: (outImages[0] || {}).url || '',
             markdown: markdown,
         };
         if (allErrors.length) res.partial_errors = allErrors.join(' | ');
