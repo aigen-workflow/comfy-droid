@@ -82,6 +82,7 @@
         comic_count: 4,              // v7.0 漫画模式默认分镜数（1~4）
         character_ref: '',           // v7.0 角色参考图 URL（用户上传/三视图选中后锁定；后续漫画生成自动作 img2img 参考）
         character_constants: '',     // v7.1 角色常量块（英文标签：脸/发型/服装/身材/LoRA触发词），漫画每格自动拼入 positive 开头锁角色
+        view_sheet: [],              // v7.2 最近一次三视图出图 URL 列表（供"用第N张"选择锁定角色图）
     };
 
     // 姿势图库索引（与电脑端 Comfy input/pose_library/ 下的图片对应，供 LLM 选姿势）
@@ -212,6 +213,7 @@
                     image: { type: 'string', description: '（可选）参考图 URL。当用户要求"修改/换装/换衣服/重绘/改上图/上面这张图"等基于已有图片的修改时，必须传用户消息中图片的 URL；扩展自动走图生图（img2img），保留原图人物与构图，只按 positive 改衣服等部分。纯新图生成不传此参数。' },
                     pose_file: { type: 'string', description: '（可选）姿势图库文件名。复杂双人动作必填：cowgirl_01.png=女上位跨坐、missionary_01~52.png=男上正面、oral_01~06.png=跪姿/口部特写、closeup_01~03.png=脸/上半身特写、from_behind_03~04.png=背后双人(双女慎用)、throne_pose.jpg=王座式、lift_pose.jpg=仰卧托举、backbend_lift.jpg=站立托举后仰、ballroom_dance.jpg=交谊舞牵手、piggyback.jpg=背背。选最接近用户动作的一张' },
                     count: { type: 'integer', description: '（可选）一次生成几张，默认1，最大4。仅当用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。' },
+                    frames: { type: 'array', items: { type: 'string' }, description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。' },
                     view: { type: 'string', description: '（可选）角色设定视图：front=正面、side=侧面、back=背面。用户要求"角色三视图/设定图/正侧面"时，一次调用传 count=3 并分别用 front/side/back 生成三张（角色着衣全身设定图，用于锁定角色外貌）；不用此参数时省略。' },
                     width: { type: 'integer', description: '图片宽度，默认896' },
                     height: { type: 'integer', description: '图片高度，默认1152' },
@@ -945,8 +947,14 @@
 
         // ---- v6.9 张数解析：count=N（1~4），默认1 ----
         // v7.0 漫画模式：未显式传 count 时默认 comic_count（4）；漫画分镜保持角色一致
+        // v7.2 frames 分镜数组：模型把长剧情拆成每格独立描述（数组），count=frames.length（上限4），
+        // 每格用 frames[i] 作为该格画面内容——解决"长文不拆格、4格同图"问题。
+        let frames = Array.isArray(a.frames) ? a.frames.filter((f) => String(f).trim().length > 0) : [];
+        if (frames.length > 4) frames = frames.slice(0, 4);
         let count = parseInt(a.count, 10);
-        if (!count || isNaN(count)) {
+        if (frames.length > 0) {
+            count = frames.length;
+        } else if (!count || isNaN(count)) {
             count = settings.comic_mode ? (settings.comic_count || 4) : 1;
         }
         count = Math.max(1, Math.min(4, count));
@@ -974,16 +982,18 @@
         for (let i = 0; i < count; i++) {
             let one;
             const oneArgs = Object.assign({}, a);
+            // v7.2 frames 优先：该格画面 = 常量块 + frames[i]（模型已按剧情拆好的单格描述）
+            const framePos = frames.length > 0 ? String(frames[i % frames.length] || '') : String(oneArgs.positive || '');
             if (viewMode) {
                 const v = viewOrder[i % viewOrder.length];
-                oneArgs.positive = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + ', character sheet ' + v + ' view, full body, standing straight, arms relaxed at sides, neutral pose, whole character visible from head to feet, plain background, consistent character design, clothing fully covering body';
+                oneArgs.positive = (charConst ? charConst + ', ' : '') + framePos + ', character sheet ' + v + ' view, full body, standing straight, arms relaxed at sides, neutral pose, whole character visible from head to feet, plain background, consistent character design, clothing fully covering body';
             } else if (isComic) {
-                // 分镜 i+1：常量块 + 分镜序号 + 连贯纪律；模型写的 positive 作为该格变量（场景/动作）
-                const frameSeq = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + '\ncomic panel ' + (i + 1) + ' of ' + count + ', sequential story frame, same characters, same outfits, same style as previous panel, consistent character design, continuous storytelling, cinematic photorealistic manga page, no speech bubbles, no text overlay';
+                // 分镜 i+1：常量块 + 该格描述 + 分镜序号 + 连贯纪律
+                const frameSeq = (charConst ? charConst + ', ' : '') + framePos + '\ncomic panel ' + (i + 1) + ' of ' + count + ', sequential story frame, same characters, same outfits, same style as previous panel, consistent character design, continuous storytelling, cinematic photorealistic manga page, no speech bubbles, no text overlay';
                 oneArgs.positive = frameSeq;
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
-                if (i > 0) oneArgs.positive = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + ', variant ' + (i + 1) + ', different composition';
+                if (i > 0) oneArgs.positive = (charConst ? charConst + ', ' : '') + framePos + ', variant ' + (i + 1) + ', different composition';
             }
             try {
                 one = JSON.parse(await generateOneImage(oneArgs));
@@ -1000,6 +1010,11 @@
         }
         if (!allImages.length) {
             return JSON.stringify({ status: 'error', message: '多张生成全部失败：' + allErrors.join(' | ') });
+        }
+        // v7.2 三视图生成后记住 URL 列表，供用户"用第N张"锁定角色图
+        if (viewMode) {
+            settings.view_sheet = allImages.map((im) => im.url || '');
+            saveSettingsDebounced();
         }
         const markdown = allImages.map((im) => '![image](' + im.url + ')').join('\n');
         const res = {
@@ -1397,6 +1412,14 @@
                     description: '（可选）一次生成几张，默认1，最大4。仅当用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。',
                 };
             }
+            // v7.2：注入 frames 参数（漫画分镜数组，长剧情拆格）
+            if (!parameters.properties.frames) {
+                parameters.properties.frames = {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。',
+                };
+            }
             // v7.0：注入 view 参数（角色设定三视图，着衣）
             if (!parameters.properties.view) {
                 parameters.properties.view = {
@@ -1481,6 +1504,19 @@
                 console.log('[ComfyDroid] 角色参考图已保存：' + refUrl);
             }
         }
+        // v7.2 三视图选择：用户刚生成三视图后说"用第N张/选第N张/第N张" → 锁定对应那张为角色图
+        const sheetPick = msgText.match(/用第\s*([一二三123])\s*张|选第\s*([一二三123])\s*张|就第\s*([一二三123])\s*张|第\s*([一二三123])\s*张\s*(?:当|作|做|设为)?\s*(?:角色|人物)?/);
+        if (sheetPick && Array.isArray(settings.view_sheet) && settings.view_sheet.length) {
+            const numStr = sheetPick[1] || sheetPick[2] || sheetPick[3] || sheetPick[4] || '1';
+            const numMap = { 一: 1, 二: 2, 三: 3, 1: 1, 2: 2, 3: 3 };
+            const idx = (numMap[numStr] || 1) - 1;
+            const pickedUrl = settings.view_sheet[idx];
+            if (pickedUrl && pickedUrl !== settings.character_ref) {
+                settings.character_ref = pickedUrl;
+                saveSettingsDebounced();
+                console.log('[ComfyDroid] 三视图已选第' + (idx + 1) + '张，锁定为角色图：' + pickedUrl);
+            }
+        }
         const hasDrawIntent = DRAW_KEYWORDS.test(msgText);
         // v6.6：换装/修改类短句（"换一身…衣服/改…/修改上图"等）不含"画/图/生成"关键词，
         // 也必须注入 imgHint，否则模型拿不到用户附图 URL，只能从历史里抓错的参考图。
@@ -1491,10 +1527,10 @@
         const hasCharConst = String(settings.character_constants || '').trim().length > 0;
         const hasCharRef = String(settings.character_ref || '').length > 0;
         const comicHint = (settings.comic_mode || isComicMsg)
-            ? '\n[漫画模式·强制] 本请求按真实画风漫画生成：调用 comfy_generate_image 并传 count=' + (settings.comic_count || 4) + '，一次出全部连续剧情分镜；每张 = 一个场景/动作。'
-                + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格 positive 必须**一字不改**以该常量块开头，只写该格的变化部分（场景/动作/表情/镜头）。禁止重写或增删角色外貌描述。' : '')
+            ? '\n[漫画模式·强制] 本请求按真实画风连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤4），每个画面一格，一格一个场景+动作+情绪**，然后调用 comfy_generate_image 并把每个画面写成**一个完整的英文画面描述**，放进 **frames 参数（字符串数组）**，一次调用生成全部。禁止把整段剧情写成一句话塞进 positive（那会导致 4 格全是同一张图）；禁止不拆格直接传 count=4（没意义）。'
+                + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
-                + '\n各格之间必须保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
+                + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
             : '';
         // v6.5 图生图：若上下文存在最近用户图片 URL，注入给模型（改上图时必须传 image）
         // v6.6 优先从当前消息文本提取附图 URL（chat 数组可能尚未包含本条消息）；
