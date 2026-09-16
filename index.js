@@ -83,6 +83,7 @@
         character_ref: '',           // v7.0 角色参考图 URL（用户上传/三视图选中后锁定；后续漫画生成自动作 img2img 参考）
         character_constants: '',     // v7.1 角色常量块（英文标签：脸/发型/服装/身材/LoRA触发词），漫画每格自动拼入 positive 开头锁角色
         view_sheet: [],              // v7.2 最近一次三视图出图 URL 列表（供"用第N张"选择锁定角色图）
+        comic_grid: true,            // v7.3 漫画拼页：漫画分镜生成后自动拼成一张 2x2 漫画页返回（保留各格原图）
     };
 
     // 姿势图库索引（与电脑端 Comfy input/pose_library/ 下的图片对应，供 LLM 选姿势）
@@ -1016,16 +1017,82 @@
             settings.view_sheet = allImages.map((im) => im.url || '');
             saveSettingsDebounced();
         }
-        const markdown = allImages.map((im) => '![image](' + im.url + ')').join('\n');
+        // v7.3 漫画拼页：漫画分镜（非三视图、非普通变体）且拼页开关开/用户要求拼页时，
+        // 把各格拼成一张 2x2 漫画页，作为第一张返回（原图仍在 images 里可单独取用）。
+        const wantsGrid = /拼页|拼图|拼成|合成一页|合成一张|一张多格|漫画页|多格|排成一页|2x2|两行|四格|宫格/i.test(String(getLastUserMsgText()));
+        let gridImage = null;
+        if (isComic && !viewMode && (settings.comic_grid || wantsGrid) && allImages.length >= 2) {
+            const gridUrl = await comicGridCompose(allImages.map((im) => im.url));
+            if (gridUrl) {
+                gridImage = { url: gridUrl, name: 'comic_grid', is_grid: true };
+            }
+        }
+        let markdown;
+        const outImages = [];
+        if (gridImage) {
+            outImages.push(gridImage, ...allImages);
+            markdown = '![image](' + gridImage.url + ')\n\n[各格分镜]\n' + allImages.map((im) => '![image](' + im.url + ')').join('\n');
+        } else {
+            outImages.push(...allImages);
+            markdown = allImages.map((im) => '![image](' + im.url + ')').join('\n');
+        }
         const res = {
             status: 'done',
             count: allImages.length,
-            images: allImages,
-            image_url: allImages[0].url,
+            images: outImages,
+            image_url: (gridImage || outImages[0]).url,
             markdown: markdown,
         };
         if (allErrors.length) res.partial_errors = allErrors.join(' | ');
         return JSON.stringify(res);
+    }
+
+    // v7.3 漫画拼页：把多格分镜拼成一张 2x2 漫画页（Canvas 合成 → 上传回 Comfy → 返回拼接图 URL）
+    // 依赖 Comfy 启动参数 --enable-cors-header "*"（已配置），WebView 内可 fetch 各格图。
+    async function comicGridCompose(urls) {
+        try {
+            if (!Array.isArray(urls) || urls.length < 2) return '';
+            const n = Math.min(urls.length, 4);
+            const cols = 2;
+            const rows = Math.ceil(n / 2);
+            const cellW = 640, cellH = 936, gap = 14, pad = 10;
+            const canvas = document.createElement('canvas');
+            canvas.width = pad * 2 + cols * cellW + (cols - 1) * gap;
+            canvas.height = pad * 2 + rows * cellH + (rows - 1) * gap;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const loaded = [];
+            for (let i = 0; i < n; i++) {
+                try {
+                    const r = await fetch(urls[i]);
+                    if (!r.ok) continue;
+                    const bmp = await createImageBitmap(await r.blob());
+                    loaded.push(bmp);
+                } catch (e) { /* 单格失败跳过 */ }
+            }
+            if (!loaded.length) return '';
+            for (let i = 0; i < loaded.length; i++) {
+                const col = i % cols, row = Math.floor(i / cols);
+                const dx = pad + col * (cellW + gap);
+                const dy = pad + row * (cellH + gap);
+                ctx.drawImage(loaded[i], dx, dy, cellW, cellH);
+            }
+            const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+            if (!blob) return '';
+            const base0 = String(settings.comfy_endpoint || '').replace(/\/+$/, '');
+            if (!base0) return '';
+            const fd = new FormData();
+            fd.append('image', blob, 'comic_grid_' + Date.now() + '.png');
+            fd.append('type', 'input');
+            const up = await fetch(base0 + '/upload/image', { method: 'POST', body: fd });
+            const upj = await up.json();
+            if (!upj || !upj.name) return '';
+            return base0 + '/view?filename=' + encodeURIComponent(upj.name) + '&type=input';
+        } catch (e) {
+            console.error('[ComfyDroid] 漫画拼页失败：', e);
+            return '';
+        }
     }
 
     // 单张生成全流程（工作流→提交→轮询→质量审查→局部修复）。每张独立调用，
@@ -1528,6 +1595,7 @@
         const hasCharRef = String(settings.character_ref || '').length > 0;
         const comicHint = (settings.comic_mode || isComicMsg)
             ? '\n[漫画模式·强制] 本请求按真实画风连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤4），每个画面一格，一格一个场景+动作+情绪**，然后调用 comfy_generate_image 并把每个画面写成**一个完整的英文画面描述**，放进 **frames 参数（字符串数组）**，一次调用生成全部。禁止把整段剧情写成一句话塞进 positive（那会导致 4 格全是同一张图）；禁止不拆格直接传 count=4（没意义）。'
+                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a figure）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：景别（wide shot / medium shot / close-up / low angle / overhead）；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
                 + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
@@ -1657,6 +1725,9 @@
               <label class="checkbox_label" for="cd_comic_mode">
                 <input type="checkbox" id="cd_comic_mode"> 漫画模式（真实画风连续剧情分镜：默认一次出4格，每格一个场景/动作，保持同一角色）
               </label>
+              <label class="checkbox_label" for="cd_comic_grid">
+                <input type="checkbox" id="cd_comic_grid"> 漫画拼页（分镜生成后自动拼成一张 2x2 漫画页返回；关闭则只返回各格独立图）
+              </label>
               <div style="margin-top:8px;">
                 <label for="cd_char_ref">角色参考图 URL（上传角色图后说"用我的角色/设为角色图"自动保存；漫画/换装时用它锁定角色不漂移）</label>
                 <input id="cd_char_ref" class="text_pole" placeholder="https://... 或留空">
@@ -1721,6 +1792,8 @@
         if (useSdxlEl) useSdxlEl.checked = settings.use_sdxl !== false;
         const comicModeEl = document.getElementById('cd_comic_mode');
         if (comicModeEl) comicModeEl.checked = !!settings.comic_mode;
+        const comicGridEl = document.getElementById('cd_comic_grid');
+        if (comicGridEl) comicGridEl.checked = settings.comic_grid !== false;
         setVal('cd_char_ref', settings.character_ref);
         setVal('cd_char_const', settings.character_constants);
 
@@ -1774,6 +1847,12 @@
         if (comicModeEl) {
             comicModeEl.addEventListener('change', () => {
                 settings.comic_mode = comicModeEl.checked;
+                saveSettingsDebounced();
+            });
+        }
+        if (comicGridEl) {
+            comicGridEl.addEventListener('change', () => {
+                settings.comic_grid = comicGridEl.checked;
                 saveSettingsDebounced();
             });
         }
