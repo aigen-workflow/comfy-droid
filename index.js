@@ -565,7 +565,15 @@
         // v7.4 漫画模式强制真人写实：用户要"真实画风漫画"。即使模型写崩风格词、
         // 或 comic_style 被开启，只要本次是漫画分镜请求，就强制追加 photorealistic
         // 写实词块（已含则跳过），保证画面是照片级真人，而不是动漫/插画。
+        // v7.5 同时清洗"多格排版词"：模型会把 "comic page / 2x2 / panel" 理解成
+        // 一张图内画多个格子（用户实测翻车成 8 格小图+英文气泡）。分页拼格只能由
+        // 扩展 comicGridCompose 做，提示词里必须是一格一画面。
         if (useSdxl && (settings.comic_mode || Array.isArray(a.frames) || /漫画|分镜|连环|剧情画面|连续画面/i.test(String(a.positive || '') + ' ' + String(getLastUserMsgText())))) {
+            positive = String(positive || '')
+                .replace(/comic page|2x2 ?grid|white gutters|page layout|comic strip|four[- ]?panel|sequential panels|graphic novel|digital painting|comic book illustration|speech bubbles|dialogue bubbles|text bubbles|with text|with captions?|on the panel|panel \d|panels? /gi, ' ')
+                .replace(/,\s*,/g, ',')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
             const comicReal = /photorealistic|realistic photo|photography|photo of/i.test(positive);
             if (!comicReal) {
                 positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, realistic materials, high quality, ' + positive;
@@ -961,8 +969,9 @@
         // v7.0 漫画模式：未显式传 count 时默认 comic_count（4）；漫画分镜保持角色一致
         // v7.2 frames 分镜数组：模型把长剧情拆成每格独立描述（数组），count=frames.length（上限4），
         // 每格用 frames[i] 作为该格画面内容——解决"长文不拆格、4格同图"问题。
+        // v7.5 frames 上限提到 16：支持"4 页漫画页 × 每页 4 格"，扩展按每 4 格自动拼一张 2x2 页。
         let frames = Array.isArray(a.frames) ? a.frames.filter((f) => String(f).trim().length > 0) : [];
-        if (frames.length > 4) frames = frames.slice(0, 4);
+        if (frames.length > 16) frames = frames.slice(0, 16);
         let count = parseInt(a.count, 10);
         if (frames.length > 0) {
             count = frames.length;
@@ -1000,8 +1009,10 @@
                 const v = viewOrder[i % viewOrder.length];
                 oneArgs.positive = (charConst ? charConst + ', ' : '') + framePos + ', character sheet ' + v + ' view, full body, standing straight, arms relaxed at sides, neutral pose, whole character visible from head to feet, plain background, consistent character design, clothing fully covering body';
             } else if (isComic) {
-                // 分镜 i+1：常量块 + 该格描述 + 分镜序号 + 连贯纪律
-                const frameSeq = (charConst ? charConst + ', ' : '') + framePos + '\ncomic panel ' + (i + 1) + ' of ' + count + ', sequential story frame, same characters, same outfits, same style as previous panel, consistent character design, continuous storytelling, cinematic photorealistic manga page, no speech bubbles, no text overlay';
+                // 分镜 i+1：常量块 + 该格描述 + "story scene 一格一画面"纪律。
+                // v7.5 禁用 "comic panel / panel layout / 2x2" 等排版词——那些会诱导模型
+                // 把多格塞进同一张图（用户实测翻车）。分页拼格由扩展 comicGridCompose 完成。
+                const frameSeq = (charConst ? charConst + ', ' : '') + framePos + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image';
                 oneArgs.positive = frameSeq;
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
@@ -1033,26 +1044,35 @@
             saveSettingsDebounced();
         }
         // v7.3 漫画拼页：漫画分镜（非三视图、非普通变体）且拼页开关开/用户要求拼页时，
-        // 把各格拼成一张 2x2 漫画页，作为第一张返回（原图仍在 images 里可单独取用）。
-        const wantsGrid = /拼页|拼图|拼成|合成一页|合成一张|一张多格|漫画页|多格|排成一页|2x2|两行|四格|宫格/i.test(String(getLastUserMsgText()));
-        let gridImage = null;
-        if (isComic && !viewMode && (settings.comic_grid || wantsGrid) && allImages.length >= 2) {
-            const gridUrl = await comicGridCompose(allImages.map((im) => im.url));
-            if (gridUrl) {
-                gridImage = { url: gridUrl, name: 'comic_grid', is_grid: true };
-            }
-        }
+        // 把各格拼成 2x2 漫画页返回（原图仍在 images 里可单独取用）。
+        // v7.5 多页支持：frames 超过 4 格（用户要"4 张漫画页、每张 4 小格"=16 格）时，
+        // 按每 4 格一组自动拼成多张漫画页，每页下方带该页 4 句中文配文。
+        const wantsGrid = /拼页|拼图|拼成|合成一页|合成一张|一张多格|漫画页|多格|排成一页|2x2|两行|四格|宫格|漫画图片|四张漫画/i.test(String(getLastUserMsgText()));
+        const shouldGrid = isComic && !viewMode && (settings.comic_grid || wantsGrid) && allImages.length >= 2;
         let markdown;
         const outImages = [];
-        // v7.4 配文：每格图下方附中文 caption（> 格N：中文），拼页时拼页图在最前
+        // v7.4 配文：每格图下方附中文 caption（> 格N：中文）
         const captionMd = (im, idx) => {
             const cap = im && im.caption;
             if (!cap) return '![image](' + im.url + ')';
             return '![image](' + im.url + ')\n> 格' + (idx + 1) + '：' + cap;
         };
-        if (gridImage) {
-            outImages.push(gridImage, ...allImages);
-            markdown = '![image](' + gridImage.url + ')\n\n[各格分镜]\n' + allImages.map(captionMd).join('\n\n');
+        if (shouldGrid) {
+            const pageSize = 4;
+            const pageCount = Math.ceil(allImages.length / pageSize);
+            const pageBlocks = [];
+            for (let p = 0; p < pageCount; p++) {
+                const slice = allImages.slice(p * pageSize, p * pageSize + pageSize);
+                const gridUrl = await comicGridCompose(slice.map((im) => im.url));
+                if (gridUrl) {
+                    outImages.push({ url: gridUrl, name: 'comic_grid_p' + (p + 1), is_grid: true });
+                    pageBlocks.push('![image](' + gridUrl + ')\n\n[第' + (p + 1) + '页 各格分镜]\n' + slice.map(captionMd).join('\n\n'));
+                } else {
+                    outImages.push(...slice);
+                    pageBlocks.push(slice.map(captionMd).join('\n\n'));
+                }
+            }
+            markdown = pageBlocks.join('\n\n');
         } else {
             outImages.push(...allImages);
             markdown = allImages.map(captionMd).join('\n\n');
@@ -1633,11 +1653,12 @@
         const hasCharConst = String(settings.character_constants || '').trim().length > 0;
         const hasCharRef = String(settings.character_ref || '').length > 0;
         const comicHint = (settings.comic_mode || isComicMsg)
-            ? '\n[漫画模式·强制] 本请求按**真人照片级写实画风**连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤4），每个画面一格，一格一个场景+动作+情绪**，然后调用 comfy_generate_image：'
+            ? '\n[漫画模式·强制] 本请求按**真人照片级写实画风**连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤16，一格=一个场景+动作+情绪；默认 N=4 一页，用户要 4 页漫画=16 格）**，然后调用 comfy_generate_image：'
                 + '\n① frames 参数（字符串数组）：每格一个**专业英文提示词**（仅供生图，规则见下）；'
                 + '\n② captions 参数（字符串数组，与 frames 一一对应）：每格一句**中文**配文（该格对白/旁白/剧情说明，展示在图片下方）。'
-                + '\n禁止把整段剧情写成一句话塞进 frames（那会导致 4 格全是同一张图）；禁止不拆格直接传 count=4；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
-                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a figure）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：景别（wide shot / medium shot / close-up / low angle / overhead）；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文。'
+                + '\n【一格一画面·最高强制】每张图只画一个画面。frames 里**禁止**写 "comic page / 2x2 grid / white gutters / panel layout / comic strip / 4-panel / speech bubbles / text in image" 等任何排版/多格/文字词——那会让模型把很多格子塞进一张图（实测翻车）。分页拼接由扩展自动完成：每 4 格拼成一张 2×2 漫画页。'
+                + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
+                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
                 + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字。最终回复里除图片外，只写简洁中文说明（剧情/对白），禁止任何英文解释。'
