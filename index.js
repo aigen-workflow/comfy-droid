@@ -934,6 +934,17 @@
         return false;
     }
 
+    // ---- v7.7 主角性别锚定：从第 1 格 frames 提取主角性别词，供后续格硬注入 ----
+    // 解决"第一格男性、后格画成女性"的角色漂移。提取失败返回 ''（不注入，不误伤多角色格）。
+    function inferProtagonistGender(frameText) {
+        const t = String(frameText || '');
+        const male = /(^|[^a-z])(male|man|men|boy|guy|him|his|he)([^a-z]|$)/i;
+        const female = /(^|[^a-z])(female|woman|women|girl|her|hers|she)([^a-z]|$)/i;
+        if (male.test(t) && !female.test(t)) return '1 adult male protagonist, male face, short hair, flat chest, masculine body';
+        if (female.test(t) && !male.test(t)) return '1 adult female protagonist, female face, feminine body';
+        return '';
+    }
+
     // ---- v6.9 多张生成入口 ----
     // 用户明确要求"生成N张/几张图/多张/分镜"时，模型传 count=N（1~3）。
     // 一次工具调用内逐张生成（每张独立 seed + 独立质量审查链），收集全部结果返回。
@@ -978,7 +989,8 @@
         } else if (!count || isNaN(count)) {
             count = settings.comic_mode ? (settings.comic_count || 4) : 1;
         }
-        count = Math.max(1, Math.min(4, count));
+        // v7.7 修复：frames 场景 count 上限放宽到 16（此前硬限 4 导致 16 格只出前 4 格）
+        count = Math.max(1, Math.min(frames.length > 0 ? 16 : 4, count));
 
         // v7.0 三视图模式强制 3 张（正面/侧面/背面）
         const viewMode = /front|side|back|正面|侧面|背面|三视图|设定图/.test(String(a.view || ''))
@@ -1012,7 +1024,13 @@
                 // 分镜 i+1：常量块 + 该格描述 + "story scene 一格一画面"纪律。
                 // v7.5 禁用 "comic panel / panel layout / 2x2" 等排版词——那些会诱导模型
                 // 把多格塞进同一张图（用户实测翻车）。分页拼格由扩展 comicGridCompose 完成。
-                const frameSeq = (charConst ? charConst + ', ' : '') + framePos + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image';
+                // v7.7 加回角色一致性词（v7.5 误删导致"第一格男、后格变女"）：
+                //   ① 主角身份锁定：same protagonist / same gender / same outfit / consistent character
+                //   ② 性别锚定：从第 1 格提取 male/female 等性别词，硬注入后续每格
+                const protoGender = (i > 0 && frames.length > 1) ? inferProtagonistGender(frames[0]) : '';
+                const frameSeq = (charConst ? charConst + ', ' : '') + framePos
+                    + (protoGender ? ', ' + protoGender : '')
+                    + '\nstory scene ' + (i + 1) + ' of ' + count + ', single cinematic frame, one scene per image, no comic panels, no page layout, no speech bubbles, no text in image, same protagonist as scene 1, same gender, same face, same hairstyle, same outfit, consistent character identity across all scenes';
                 oneArgs.positive = frameSeq;
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
