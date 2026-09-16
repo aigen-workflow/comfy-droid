@@ -215,6 +215,7 @@
                     pose_file: { type: 'string', description: '（可选）姿势图库文件名。复杂双人动作必填：cowgirl_01.png=女上位跨坐、missionary_01~52.png=男上正面、oral_01~06.png=跪姿/口部特写、closeup_01~03.png=脸/上半身特写、from_behind_03~04.png=背后双人(双女慎用)、throne_pose.jpg=王座式、lift_pose.jpg=仰卧托举、backbend_lift.jpg=站立托举后仰、ballroom_dance.jpg=交谊舞牵手、piggyback.jpg=背背。选最接近用户动作的一张' },
                     count: { type: 'integer', description: '（可选）一次生成几张，默认1，最大4。仅当用户明确要求"生成N张/两张/三张/四张/多张/几个分镜/漫画"时传对应数字；用户没要求多张时必须省略或传1。' },
                     frames: { type: 'array', items: { type: 'string' }, description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。' },
+                    captions: { type: 'array', items: { type: 'string' }, description: '（可选·漫画配文专用）中文配文数组，与 frames 一一对应：每格一句中文（该格的对白/旁白/剧情说明，供展示在图片下方）。必须用中文写；只有 frames 里的提示词用英文。不传则无配文。' },
                     view: { type: 'string', description: '（可选）角色设定视图：front=正面、side=侧面、back=背面。用户要求"角色三视图/设定图/正侧面"时，一次调用传 count=3 并分别用 front/side/back 生成三张（角色着衣全身设定图，用于锁定角色外貌）；不用此参数时省略。' },
                     width: { type: 'integer', description: '图片宽度，默认896' },
                     height: { type: 'integer', description: '图片高度，默认1152' },
@@ -558,6 +559,16 @@
             if (!hasStyle) {
                 // v6.2 专业写实术语库：质量+画风+光线+镜头+材质，标签化注入
                 positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, soft natural lighting, rim light, 85mm lens, shallow depth of field, realistic materials, high quality, ' + positive;
+            }
+        }
+
+        // v7.4 漫画模式强制真人写实：用户要"真实画风漫画"。即使模型写崩风格词、
+        // 或 comic_style 被开启，只要本次是漫画分镜请求，就强制追加 photorealistic
+        // 写实词块（已含则跳过），保证画面是照片级真人，而不是动漫/插画。
+        if (useSdxl && (settings.comic_mode || Array.isArray(a.frames) || /漫画|分镜|连环|剧情画面|连续画面/i.test(String(a.positive || '') + ' ' + String(getLastUserMsgText())))) {
+            const comicReal = /photorealistic|realistic photo|photography|photo of/i.test(positive);
+            if (!comicReal) {
+                positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, realistic materials, high quality, ' + positive;
             }
         }
 
@@ -1002,6 +1013,10 @@
                 one = { status: 'error', message: String(e) };
             }
             if (one && one.status === 'done' && Array.isArray(one.images) && one.images.length) {
+                // v7.4 中文配文：frames 模式下把 captions[i] 挂到该格第一张图
+                if (frames.length > 0 && Array.isArray(a.captions) && String(a.captions[i] || '').trim()) {
+                    try { one.images[0].caption = String(a.captions[i]).trim(); } catch (e) { /* 忽略 */ }
+                }
                 allImages.push(...one.images);
             } else if (one && one.error) {
                 allErrors.push(String(one.error).slice(0, 150));
@@ -1029,12 +1044,18 @@
         }
         let markdown;
         const outImages = [];
+        // v7.4 配文：每格图下方附中文 caption（> 格N：中文），拼页时拼页图在最前
+        const captionMd = (im, idx) => {
+            const cap = im && im.caption;
+            if (!cap) return '![image](' + im.url + ')';
+            return '![image](' + im.url + ')\n> 格' + (idx + 1) + '：' + cap;
+        };
         if (gridImage) {
             outImages.push(gridImage, ...allImages);
-            markdown = '![image](' + gridImage.url + ')\n\n[各格分镜]\n' + allImages.map((im) => '![image](' + im.url + ')').join('\n');
+            markdown = '![image](' + gridImage.url + ')\n\n[各格分镜]\n' + allImages.map(captionMd).join('\n\n');
         } else {
             outImages.push(...allImages);
-            markdown = allImages.map((im) => '![image](' + im.url + ')').join('\n');
+            markdown = allImages.map(captionMd).join('\n\n');
         }
         const res = {
             status: 'done',
@@ -1049,7 +1070,10 @@
 
     // v7.3 漫画拼页：把多格分镜拼成一张 2x2 漫画页（Canvas 合成 → 上传回 Comfy → 返回拼接图 URL）
     // 依赖 Comfy 启动参数 --enable-cors-header "*"（已配置），WebView 内可 fetch 各格图。
+    // v7.4 修复：所有 fetch 加 AbortController 超时（cpolar 域名一变旧地址会无限挂起导致整次生成卡死），
+    // 任一步失败/超时直接返回 '' 跳过拼页，绝不阻塞出图。
     async function comicGridCompose(urls) {
+        const deadline = Date.now() + 20000; // 拼页整体 20s 上限
         try {
             if (!Array.isArray(urls) || urls.length < 2) return '';
             const n = Math.min(urls.length, 4);
@@ -1064,12 +1088,16 @@
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             const loaded = [];
             for (let i = 0; i < n; i++) {
+                if (Date.now() > deadline) break;
                 try {
-                    const r = await fetch(urls[i]);
+                    const ctl = new AbortController();
+                    const to = setTimeout(() => ctl.abort(), 8000);
+                    const r = await fetch(urls[i], { signal: ctl.signal });
+                    clearTimeout(to);
                     if (!r.ok) continue;
                     const bmp = await createImageBitmap(await r.blob());
                     loaded.push(bmp);
-                } catch (e) { /* 单格失败跳过 */ }
+                } catch (e) { /* 单格失败/超时跳过 */ }
             }
             if (!loaded.length) return '';
             for (let i = 0; i < loaded.length; i++) {
@@ -1085,12 +1113,15 @@
             const fd = new FormData();
             fd.append('image', blob, 'comic_grid_' + Date.now() + '.png');
             fd.append('type', 'input');
-            const up = await fetch(base0 + '/upload/image', { method: 'POST', body: fd });
+            const upCtl = new AbortController();
+            const upTo = setTimeout(() => upCtl.abort(), 10000);
+            const up = await fetch(base0 + '/upload/image', { method: 'POST', body: fd, signal: upCtl.signal });
+            clearTimeout(upTo);
             const upj = await up.json();
             if (!upj || !upj.name) return '';
             return base0 + '/view?filename=' + encodeURIComponent(upj.name) + '&type=input';
         } catch (e) {
-            console.error('[ComfyDroid] 漫画拼页失败：', e);
+            console.error('[ComfyDroid] 漫画拼页失败（已跳过，不影响出图）：', e);
             return '';
         }
     }
@@ -1487,6 +1518,14 @@
                     description: '（可选·漫画分镜专用）分镜数组：把用户的长剧情/故事拆成 N 个连续画面（N≤4），每格一个完整的英文画面描述（该格场景+人物动作+镜头+情绪）。传了 frames 就按 frames 长度逐格生成，不需要再传 count。禁止把整段剧情写成一个字符串塞进来。',
                 };
             }
+            // v7.4：注入 captions 参数（中文配文，与 frames 一一对应）
+            if (!parameters.properties.captions) {
+                parameters.properties.captions = {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: '（可选·漫画配文专用）中文配文数组，与 frames 一一对应：每格一句中文（该格的对白/旁白/剧情说明，供展示在图片下方）。必须用中文写；只有 frames 里的提示词用英文。不传则无配文。',
+                };
+            }
             // v7.0：注入 view 参数（角色设定三视图，着衣）
             if (!parameters.properties.view) {
                 parameters.properties.view = {
@@ -1594,11 +1633,14 @@
         const hasCharConst = String(settings.character_constants || '').trim().length > 0;
         const hasCharRef = String(settings.character_ref || '').length > 0;
         const comicHint = (settings.comic_mode || isComicMsg)
-            ? '\n[漫画模式·强制] 本请求按真实画风连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤4），每个画面一格，一格一个场景+动作+情绪**，然后调用 comfy_generate_image 并把每个画面写成**一个完整的英文画面描述**，放进 **frames 参数（字符串数组）**，一次调用生成全部。禁止把整段剧情写成一句话塞进 positive（那会导致 4 格全是同一张图）；禁止不拆格直接传 count=4（没意义）。'
+            ? '\n[漫画模式·强制] 本请求按**真人照片级写实画风**连续剧情漫画生成。**必须把用户的长剧情/故事先在心里拆成 N 个连续画面（N≤4），每个画面一格，一格一个场景+动作+情绪**，然后调用 comfy_generate_image：'
+                + '\n① frames 参数（字符串数组）：每格一个**专业英文提示词**（仅供生图，规则见下）；'
+                + '\n② captions 参数（字符串数组，与 frames 一一对应）：每格一句**中文**配文（该格对白/旁白/剧情说明，展示在图片下方）。'
+                + '\n禁止把整段剧情写成一句话塞进 frames（那会导致 4 格全是同一张图）；禁止不拆格直接传 count=4；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
                 + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a figure）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：景别（wide shot / medium shot / close-up / low angle / overhead）；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
-                + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
+                + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字。最终回复里除图片外，只写简洁中文说明（剧情/对白），禁止任何英文解释。'
             : '';
         // v6.5 图生图：若上下文存在最近用户图片 URL，注入给模型（改上图时必须传 image）
         // v6.6 优先从当前消息文本提取附图 URL（chat 数组可能尚未包含本条消息）；
