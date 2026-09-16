@@ -81,6 +81,7 @@
         comic_mode: false,           // v7.0 漫画模式：真实画风连续剧情分镜（count 默认4，每张一个场景/动作）
         comic_count: 4,              // v7.0 漫画模式默认分镜数（1~4）
         character_ref: '',           // v7.0 角色参考图 URL（用户上传/三视图选中后锁定；后续漫画生成自动作 img2img 参考）
+        character_constants: '',     // v7.1 角色常量块（英文标签：脸/发型/服装/身材/LoRA触发词），漫画每格自动拼入 positive 开头锁角色
     };
 
     // 姿势图库索引（与电脑端 Comfy input/pose_library/ 下的图片对应，供 LLM 选姿势）
@@ -966,6 +967,8 @@
         // v7.0 漫画分镜：逐张注入分镜序号 + 剧情连贯纪律（保持同一角色/同一风格/服装一致），
         // 让多张不是重复图，而是连续剧情的 N 个场景。
         const isComic = settings.comic_mode || /漫画|分镜|连环|剧情画面|连续画面/i.test(String(getLastUserMsgText()));
+        // v7.1 角色常量块：漫画/三视图每格自动拼入 positive 开头（锁角色），模型只需写该格变量
+        const charConst = String(settings.character_constants || '').trim();
         const allImages = [];
         const allErrors = [];
         for (let i = 0; i < count; i++) {
@@ -973,14 +976,14 @@
             const oneArgs = Object.assign({}, a);
             if (viewMode) {
                 const v = viewOrder[i % viewOrder.length];
-                oneArgs.positive = String(oneArgs.positive || '') + ', character sheet ' + v + ' view, full body, standing straight, arms relaxed at sides, neutral pose, whole character visible from head to feet, plain background, consistent character design, clothing fully covering body';
+                oneArgs.positive = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + ', character sheet ' + v + ' view, full body, standing straight, arms relaxed at sides, neutral pose, whole character visible from head to feet, plain background, consistent character design, clothing fully covering body';
             } else if (isComic) {
-                // 分镜 i+1：把"第几张"语义注进 positive，并强调与前一格保持同一角色/服装/画风
-                const frameSeq = '\ncomic panel ' + (i + 1) + ' of ' + count + ', sequential story frame, same characters, same outfits, same style as previous panel, consistent character design, continuous storytelling, cinematic photorealistic manga page, no speech bubbles, no text overlay';
-                oneArgs.positive = String(oneArgs.positive || '') + frameSeq;
+                // 分镜 i+1：常量块 + 分镜序号 + 连贯纪律；模型写的 positive 作为该格变量（场景/动作）
+                const frameSeq = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + '\ncomic panel ' + (i + 1) + ' of ' + count + ', sequential story frame, same characters, same outfits, same style as previous panel, consistent character design, continuous storytelling, cinematic photorealistic manga page, no speech bubbles, no text overlay';
+                oneArgs.positive = frameSeq;
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
-                if (i > 0) oneArgs.positive = String(oneArgs.positive || '') + ', variant ' + (i + 1) + ', different composition';
+                if (i > 0) oneArgs.positive = (charConst ? charConst + ', ' : '') + String(oneArgs.positive || '') + ', variant ' + (i + 1) + ', different composition';
             }
             try {
                 one = JSON.parse(await generateOneImage(oneArgs));
@@ -1485,8 +1488,13 @@
         if (!hasDrawIntent && !hasModifyIntent) return msgText;
         // v7.0 漫画模式注入：开启时强制走"真实画风连续剧情分镜"纪律
         const isComicMsg = /漫画|分镜|连环|剧情画面|连续画面/i.test(msgText);
+        const hasCharConst = String(settings.character_constants || '').trim().length > 0;
+        const hasCharRef = String(settings.character_ref || '').length > 0;
         const comicHint = (settings.comic_mode || isComicMsg)
-            ? '\n[漫画模式·强制] 本请求按真实画风漫画生成：调用 comfy_generate_image 并传 count=' + (settings.comic_count || 4) + '，一次出全部连续剧情分镜；每张 = 一个场景/动作，各格之间必须保持同一角色（脸/发型/服装/身材完全一致）、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。positive 每格写清"第N格：场景+动作"，禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
+            ? '\n[漫画模式·强制] 本请求按真实画风漫画生成：调用 comfy_generate_image 并传 count=' + (settings.comic_count || 4) + '，一次出全部连续剧情分镜；每张 = 一个场景/动作。'
+                + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格 positive 必须**一字不改**以该常量块开头，只写该格的变化部分（场景/动作/表情/镜头）。禁止重写或增删角色外貌描述。' : '')
+                + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
+                + '\n各格之间必须保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字（文字另行输出在图下方）。'
             : '';
         // v6.5 图生图：若上下文存在最近用户图片 URL，注入给模型（改上图时必须传 image）
         // v6.6 优先从当前消息文本提取附图 URL（chat 数组可能尚未包含本条消息）；
@@ -1619,6 +1627,10 @@
                 <button id="cd_char_ref_clear" type="button" style="margin-top:4px;">清除角色图</button>
               </div>
               <div style="margin-top:8px;">
+                <label for="cd_char_const">角色常量块（漫画每格自动拼入 positive 开头锁角色；英文标签，逗号分隔。例：XH_EA_FACE, 28yo asian woman, long black hair, fair skin, red qipao）</label>
+                <textarea id="cd_char_const" class="text_pole" rows="3" style="width:100%;" placeholder="XH_EA_FACE, 28yo asian woman, long black hair, ..."></textarea>
+              </div>
+              <div style="margin-top:8px;">
                 <label for="cd_endpoint">Comfy 服务地址（含协议，如 https://xxx.trycloudflare.com）</label>
                 <input id="cd_endpoint" class="text_pole" placeholder="https://...">
               </div>
@@ -1674,6 +1686,7 @@
         const comicModeEl = document.getElementById('cd_comic_mode');
         if (comicModeEl) comicModeEl.checked = !!settings.comic_mode;
         setVal('cd_char_ref', settings.character_ref);
+        setVal('cd_char_const', settings.character_constants);
 
         // 绑定保存
         const bindSave = (id, key, coerce) => {
@@ -1740,6 +1753,13 @@
             charRefClearEl.addEventListener('click', () => {
                 settings.character_ref = '';
                 if (charRefEl) charRefEl.value = '';
+                saveSettingsDebounced();
+            });
+        }
+        const charConstEl = document.getElementById('cd_char_const');
+        if (charConstEl) {
+            charConstEl.addEventListener('input', () => {
+                settings.character_constants = charConstEl.value.trim();
                 saveSettingsDebounced();
             });
         }
