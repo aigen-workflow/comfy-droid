@@ -375,13 +375,13 @@
             }
             try {
                 const base0 = String(settings.comfy_endpoint).replace(/\/+$/, '');
-                const imgResp = await fetch(img2imgUrl);
+                const imgResp = await fetchT(img2imgUrl, {}, 30000);
                 if (!imgResp.ok) throw new Error('HTTP ' + imgResp.status);
                 const imgBlob = await imgResp.blob();
                 const srcName = 'img2img_' + Date.now() + '.png';
                 const fd = new FormData();
                 fd.append('image', imgBlob, srcName);
-                const upResp = await fetch(base0 + '/upload/image?overwrite=true', { method: 'POST', body: fd });
+                const upResp = await fetchT(base0 + '/upload/image?overwrite=true', { method: 'POST', body: fd }, 20000);
                 const upJson = await upResp.json();
                 img2imgRef = (upJson && upJson.name) || srcName;
             } catch (e) {
@@ -812,11 +812,11 @@
         const base = settings.comfy_endpoint.replace(/\/+$/, '');
         const clientId = 'comfy-droid-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
         try {
-            const resp = await fetch(base + '/prompt', {
+            const resp = await fetchT(base + '/prompt', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ prompt: workflow, client_id: clientId }),
-            });
+            }, 20000);
             const data = await resp.json();
             if (data && data.prompt_id) {
                 lastPromptId = data.prompt_id;
@@ -841,7 +841,7 @@
 
         try {
             // 先查执行历史：任务完成时 history 里才有 outputs
-            const histResp = await fetch(base + '/history/' + encodeURIComponent(pid));
+            const histResp = await fetchT(base + '/history/' + encodeURIComponent(pid), {}, 15000);
             const history = await histResp.json();
             const entry = history && history[pid];
 
@@ -849,7 +849,7 @@
                 // 尚未出结果：查队列判断是排队还是运行中
                 let status = 'pending';
                 try {
-                    const qResp = await fetch(base + '/queue');
+                    const qResp = await fetchT(base + '/queue', {}, 15000);
                     const q = await qResp.json();
                     if (q && Array.isArray(q.queue_running) && q.queue_running.some((x) => x && x[1] === pid)) status = 'running';
                     else if (q && Array.isArray(q.queue_pending) && q.queue_pending.some((x) => x && x[1] === pid)) status = 'queued';
@@ -999,8 +999,12 @@
         // v7.2 frames 分镜数组：模型把长剧情拆成每格独立描述（数组），count=frames.length（上限4），
         // 每格用 frames[i] 作为该格画面内容——解决"长文不拆格、4格同图"问题。
         // v7.5 frames 上限提到 16：支持"4 页漫画页 × 每页 4 格"，扩展按每 4 格自动拼一张 2x2 页。
-        let frames = Array.isArray(a.frames) ? a.frames.filter((f) => String(f).trim().length > 0) : [];
+        // v7.10 防御：模型可能把 frames/captions 传成字符串（实测 Tool Calling 显示
+        // "frames=cinematic realistic photo, a skinny..."）——字符串会被当数组用导致
+        // frames[i % length] 取到单字符、每格提示词变乱码。非数组一律拆成单元素数组或丢弃。
+        let frames = Array.isArray(a.frames) ? a.frames.filter((f) => String(f).trim().length > 0) : (typeof a.frames === 'string' && String(a.frames).trim() ? [String(a.frames).trim()] : []);
         if (frames.length > 16) frames = frames.slice(0, 16);
+        let captionsArr = Array.isArray(a.captions) ? a.captions : (typeof a.captions === 'string' && String(a.captions).trim() ? [String(a.captions).trim()] : []);
         let count = parseInt(a.count, 10);
         if (frames.length > 0) {
             count = frames.length;
@@ -1092,8 +1096,8 @@
             }
             if (one && one.status === 'done' && Array.isArray(one.images) && one.images.length) {
                 // v7.4 中文配文：frames 模式下把 captions[i] 挂到该格第一张图
-                if (frames.length > 0 && Array.isArray(a.captions) && String(a.captions[i] || '').trim()) {
-                    try { one.images[0].caption = String(a.captions[i]).trim(); } catch (e) { /* 忽略 */ }
+                if (frames.length > 0 && captionsArr.length > 0 && String(captionsArr[i] || '').trim()) {
+                    try { one.images[0].caption = String(captionsArr[i]).trim(); } catch (e) { /* 忽略 */ }
                 }
                 // v7.9 角色锁定：按该格性别记录最近参考图（male/female 分开；无性别标签的格不记录，
                 // 避免"宿舍女生格"污染后面男角色格）。该格实际用过的锚才记录。
@@ -1378,7 +1382,7 @@
         if (!settings.comfy_endpoint || !pid) return null;
         const base = settings.comfy_endpoint.replace(/\/+$/, '');
         try {
-            const resp = await fetch(base + '/history/' + encodeURIComponent(pid));
+            const resp = await fetchT(base + '/history/' + encodeURIComponent(pid), {}, 15000);
             const history = await resp.json();
             const entry = history && history[pid];
             if (!entry) return null;
@@ -1415,12 +1419,12 @@
             if (!faceBoxes.length && !armBoxes.length && !handBoxes.length) return { error: '无有效修复区域' };
 
             // 1) 下载出图 → 上传到 Comfy input
-            const imgResp = await fetch(imageUrl);
+            const imgResp = await fetchT(imageUrl, {}, 30000);
             const imgBlob = await imgResp.blob();
             const srcName = 'qg_repair_' + Date.now() + '.png';
             const fd = new FormData();
             fd.append('image', imgBlob, srcName);
-            const upResp = await fetch(base + '/upload/image?overwrite=true', { method: 'POST', body: fd });
+            const upResp = await fetchT(base + '/upload/image?overwrite=true', { method: 'POST', body: fd }, 20000);
             const upJson = await upResp.json();
             const uploadedName = (upJson && upJson.name) || srcName;
 
@@ -1508,11 +1512,11 @@
 
             // 3) 提交
             const body = { prompt: wf, client_id: 'comfydroid-inpaint' };
-            const subResp = await fetch(base + '/prompt', {
+            const subResp = await fetchT(base + '/prompt', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
-            });
+            }, 20000);
             const sub = await subResp.json();
             if (!sub || !sub.prompt_id) {
                 return { error: (sub && sub.error) || '重绘提交失败' };
@@ -1524,7 +1528,7 @@
             for (let i = 0; i < 120; i++) {
                 await sleep(2500);
                 try {
-                    const hist = await (await fetch(base + '/history/' + encodeURIComponent(pid))).json();
+                    const hist = await (await fetchT(base + '/history/' + encodeURIComponent(pid), {}, 15000)).json();
                     const entry = hist && hist[pid];
                     if (!entry) continue;
                     if (entry.status && entry.status.status_str === 'error') {
@@ -1779,6 +1783,23 @@
             }
         } catch (e) { /* 忽略 */ }
         return '';
+    }
+
+    // v7.10 统一带超时的 fetch：cpolar/ComfyUI 断流或域名失效时，浏览器 fetch 默认无限 pending，
+    // 会导致 generateOneImage 挂死、16 格循环停在半路、整次调用不返图（用户实测"出4张后卡住"）。
+    // 所有 ComfyUI 通信 fetch 一律走这里：提交 20s / 查询 15s / 图片下载 30s / 上传 20s。
+    async function fetchT(url, opts, timeoutMs) {
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), timeoutMs || 15000);
+        try {
+            const resp = await fetch(url, Object.assign({}, opts, { signal: ctl.signal }));
+            return resp;
+        } catch (e) {
+            if (e && e.name === 'AbortError') throw new Error('请求超时(' + (timeoutMs || 15000) + 'ms): ' + String(url).slice(0, 120));
+            throw e;
+        } finally {
+            clearTimeout(t);
+        }
     }
 
     // 从对话上下文提取最近一张用户图片的 URL（markdown 图片链接或 ST 附件字段）
