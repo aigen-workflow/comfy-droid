@@ -60,11 +60,13 @@
         pose_strength: 0.7,          // ControlNet 姿势控制强度（0.65~0.75 推荐）
         pose_controlnet: 'control_v11p_sd15_openpose.pth', // 服务端 models/controlnet 下的 OpenPose 模型（SD1.5 档）
         pose_controlnet_sdxl: 'controlnet-openpose-sdxl-1.0.safetensors', // SDXL 档的 OpenPose（SDXL 主模型必须配 SDXL ControlNet，否则执行报错）
-        pose_library_dir: 'pose_library', // 姿势图库目录（相对 Comfy 服务端 input 目录）
+        pose_library_dir: 'poses', // 姿势图库目录（相对 Comfy 服务端 input 目录；v7.14 已扁平化到 poses 根）
+        auto_pose: true,           // v7.14 为 true 时，多人/复杂动作自动从图库选骨架图锁姿势（不依赖模型传 pose_file）
         comic_style: false,          // 为 true 时出图注入漫画渲染风格（黑白/网点线稿）；默认关闭
         realistic_enhance: true,     // 为 true 时出图注入写实增强（默认开启，越接近真实越好）
         quality_gate: true,          // 为 true 时出图后自动运行 QualityGate 人物质量审查，不合格自动换 seed 重试
         quality_retry: 3,            // 质量审查未通过时的最大重试次数（每次换新 seed）
+        hands_always_fix: true,      // v7.12 为 true 时质量门 PASS 也对手/脸/臂检测框做一轮局部修复（默认开）
         use_sdxl: true,              // 为 true 时启用 SDXL 档（Juggernaut XL 方案）：SDXL 参数 + 亚洲脸 LoRA 自动注入
         checkpoint_sdxl: 'juggernautXL_ragnarokBy.safetensors', // SDXL 底模（服务端 models/checkpoints 下）
         lora_sdxl: 'authentic_asian_face_v1.safetensors',       // 亚洲脸 LoRA（服务端 models/loras 下）
@@ -336,6 +338,36 @@
         let positive = a.positive || '';
         let negative = a.negative || '';
         const poseFile = (a.pose_file || '').trim();
+        // v7.14 AutoPose：多人/复杂互动且模型没传 pose_file 时，扩展按场景关键词自动选骨架图，
+        // 经 OpenPose 提取骨骼 + SDXL ControlNet 锁人数锁动作。
+        // 图库已扁平化到 input/poses 根：three_fight_01.png=三人打斗骨架（3个骨骼）、
+        // fight_01.png=双人打斗、dance_01.jpg=交谊舞、lift_01.jpg=托举、piggyback_01.jpg=背背、
+        // backbend_01.jpg=后仰托举、standing_01.png=站立双人、missionary_01.png=地面双人。
+        // 只在 expN>=2 时启用；3 人仅打斗类有骨架，其他 3 人场景不自动配（避免骨架与动作不符）。
+        const autoPoseFile = (function () {
+            if (!settings.pose_enabled || !settings.auto_pose || poseFile) return '';
+            let expN;
+            try { expN = inferExpectedPeople(); } catch (e) { expN = 0; }
+            if (!expN || expN < 2) return '';
+            let lastText;
+            try { lastText = getLastUserMsgText() || ''; } catch (e) { lastText = ''; }
+            const hay = [lastText, positive, Array.isArray(a.frames) ? a.frames.join(' ') : ''].join(' ').toLowerCase();
+            const RULES = [
+                // 3 人打斗/对峙/冲突（优先：expN>=3 命中打斗词才配三人骨架）
+                { re: /fight|fighting|battle|combat|duel|punch|kick|对峙|打斗|搏斗|过招|交手|对打|格斗|冲突|围攻|乱战|混战|推搡|争吵|缠斗/i, file: expN >= 3 ? 'three_fight_01.png' : 'fight_01.png', strength: expN >= 3 ? 0.8 : 0.75 },
+                { re: /danc(e|ing)|舞蹈|跳舞|共舞|交谊/i, file: 'dance_01.jpg', strength: 0.7 },
+                { re: /piggyback|背背|背着|背起/i, file: 'piggyback_01.jpg', strength: 0.7 },
+                { re: /lift|carry|托举|举起|抱起|横抱|公主抱/i, file: 'lift_01.jpg', strength: 0.7 },
+                { re: /backbend|后仰.*托举|托举.*后仰/i, file: 'backbend_01.jpg', strength: 0.7 },
+                { re: /hold hands|holding hands|牵手|拉手|手牵手|并肩/i, file: 'standing_01.png', strength: 0.65 },
+                { re: /hug|embrace|cuddle|拥抱|依偎|相拥|搂住|搂着|躺在一起/i, file: 'missionary_01.png', strength: 0.6 },
+            ];
+            for (const r of RULES) {
+                if (r.re.test(hay)) return r.file;
+            }
+            return '';
+        })();
+        const poseFileFinal = poseFile || autoPoseFile;
         // v6.5 图生图换装：用户要求"修改上图/换衣服/重绘"时模型传 image（参考图 URL）。
         // 下载 → 上传 Comfy input → 工作流走 img2img（denoise<1），保留原图人物与构图。
         // v6.8 关键修复：SillyDroid 里模型经常**看不到用户附图的 URL**（消息格式化时 chat
@@ -493,9 +525,27 @@
                     }
                     const sexNeg = '2girls, two women, both women, two females, lesbian couple, single person, only one woman, lone woman, only one person, 双女, 两个女人, 单人, 一个人';
                     negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                } else if (SAME_SEX_HINTS.some((k) => hay.includes(k))) {
+                    // v7.15 双男/双女场景性别锁定：SDXL 双男先验差（第二男常被画成女），
+                    // 命中 two men/two women/男男/女女 等词时正面锁同性 + 负面排除异性。
+                    const sameSexMale = /two men|two boys|2 men|2 boys|男男|两个男人|两个男生|双男|两个男孩|gay men/i.test(hay);
+                    const sameSexFemale = /two women|two girls|2 women|2 girls|女女|两个女人|两个女生|双女|两位女士|lesbian|two ladies|two females|both women/i.test(hay);
+                    if (sameSexMale) {
+                        if (!/(two men|2 men|two boys)/i.test(positive)) positive = 'two men, ' + positive;
+                        const sexNeg = 'woman, girl, female, feminine woman, 女人, 女孩, 女性, 双性人, androgynous';
+                        negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                    } else if (sameSexFemale) {
+                        if (!/(two women|2 women|two girls)/i.test(positive)) positive = 'two women, ' + positive;
+                        const sexNeg = 'man, boy, male, masculine man, 男人, 男孩, 男性, 双性人, androgynous';
+                        negative = negative ? negative + ', ' + sexNeg : sexNeg;
+                    }
                 }
             } else if (expN === 3) {
-                const extraNeg = 'fourth person, extra person, crowd, group of people';
+                // v7.12 3人正面锁定：只加负面不够，SD 常漏画第三人（实测斗破3人格全部少人）
+                if (!/(three people|3 people|three persons|3 persons|three figures|3 figures)/i.test(positive)) {
+                    positive = 'three people, three chinese characters, ' + positive;
+                }
+                const extraNeg = 'fourth person, extra person, crowd, group of people, two people, two persons';
                 negative = negative ? negative + ', ' + extraNeg : extraNeg;
             } else if (expN === 0) {
                 const extraNeg = 'person, people, figure, human, 人物, 人影';
@@ -510,7 +560,12 @@
             if (!/(correct anatomy|natural body proportions|well-proportioned)/i.test(positive)) {
                 positive = bodyPos + ', ' + positive;
             }
-            const bodyNeg = 'extra arm, extra leg, extra hand, third arm, third leg, missing arm, missing leg, dislocated limb, merged limbs, fused limbs, deformed limbs, twisted limbs, broken anatomy, extra limbs, disfigured limbs';
+            // v7.12 手部正面词注入（正常路径此前只有修复路径有 handPos）
+            const handPos = 'natural human hands, five fingers on each hand, well-proportioned fingers, detailed realistic hands, correct hand anatomy, fingers clearly separated';
+            if (!/(natural human hand|five fingers|well-proportioned finger|hand anatomy)/i.test(positive)) {
+                positive = positive + ', ' + handPos;
+            }
+            const bodyNeg = 'extra arm, extra leg, extra hand, third arm, third leg, missing arm, missing leg, dislocated limb, merged limbs, fused limbs, deformed limbs, twisted limbs, broken anatomy, extra limbs, disfigured limbs, bad hands, malformed hands, mutated hands, deformed fingers, extra fingers, fused fingers, six fingers';
             negative = negative ? negative + ', ' + bodyNeg : bodyNeg;
         }
 
@@ -602,7 +657,7 @@
         function inferExpectedPeople() {
             const hay2 = (positive + ' ' + negative).toLowerCase();
             const PAIR_HINTS2 = ['2girls', 'two girls', 'two women', 'two people', 'two persons', 'couple', 'pair', 'double', 'both', 'dual', 'twin', 'girl and a boy', 'boy and a girl', 'man and a woman', 'woman and a man', 'hugging', 'kissing', 'embrace', 'cuddling', 'holding hands', 'dancing together', 'husband', 'wife', 'husband and wife', 'married couple', 'spouse', 'spouses', 'married', '双人', '两人', '一对', '二人', '夫妻', '夫妇', '情侣', '拥抱', '亲吻', '牵手', '依偎', '共舞'];
-            const MULTI_HINTS2 = ['three people', 'three women', 'three men', 'three men and', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', '多人', '人群', '群像', '一群', '军队', '战斗', '三人', '三个人', '三位'];
+            const MULTI_HINTS2 = ['three people', 'three women', 'three men', 'three men and', 'group of', 'crowd', 'several people', 'many people', 'multiple people', 'audience', 'team', 'gang', 'battle', 'confrontation', 'standoff', 'stand-off', 'facing each other', '围攻', '围拢', '对峙', '多人', '人群', '群像', '一群', '军队', '战斗', '三人', '三个人', '三位'];
             const hasPerson2 = /(woman|girl|man|boy|person|people|figure|character|hero|heroine|warrior|nun|soldier|husband|wife|spouse|美女|女子|男子|人物|角色|战士|女孩|女人|女生|女士|少女|男人|男生|男孩|小伙|小伙|姑娘|阿姨|大爷|大妈|妇人|少妇)/i.test(positive);
             // 姿势图 + 提示词无人数线索（纯动作/场景描述）→ 无法判断，交给肢体/脸完整审查
             if (poseFile && !hasPerson2 && !PAIR_HINTS2.some((k) => hay2.includes(k)) && !MULTI_HINTS2.some((k) => hay2.includes(k))) return -1;
@@ -734,10 +789,10 @@
         }
 
         // 姿势锁定：从图库加载姿势图 → OpenPose 提取骨骼 → ControlNet 锁姿势
-        if (settings.pose_enabled && poseFile) {
+        if (settings.pose_enabled && poseFileFinal) {
             workflow['20'] = {
                 class_type: 'LoadImage',
-                inputs: { image: settings.pose_library_dir + '/' + poseFile },
+                inputs: { image: poseFileFinal.indexOf('/') >= 0 ? poseFileFinal : settings.pose_library_dir + '/' + poseFileFinal },
             };
             workflow['21'] = {
                 class_type: 'OpenposePreprocessor',
@@ -1119,9 +1174,25 @@
                 // 【关键修复】旧版永远锁第1格图——第1格是女生时会把后面男角色也锁成女生（男变女）。
                 // 现在 male 格锁最近的 male 图、female 格锁最近的 female 图；无同性别参考则不强锁（靠提示词锚）。
                 if (comicLock && i > 0 && genderTag && genderRefMap[genderTag]) {
-                    oneArgs.image = genderRefMap[genderTag];
-                    oneArgs.img2img_denoise = settings.comic_char_lock_denoise !== undefined ? settings.comic_char_lock_denoise : 0.55;
-                    oneArgs.positive = oneArgs.positive + ', same person as the reference image, identical face, identical gender, identical hairstyle, identical outfit';
+                    // v7.14 本格按帧内容推断人数：单人帧【跳过 img2img 参考】——参考图若为多人格，
+                    // img2img 会把人数一起继承（实测单人薰儿格被双人对峙参考图带成 2 人）。
+                    // 纯文生图 + solo 词 + 亚洲脸 LoRA 对单人格更稳（v7.13 00386 验证）。
+                    let solo3 = false;
+                    let isMultiRef = false;
+                    try {
+                        // 先剥离自动追加的 "story scene N of M" 序号，避免其中的数字 N 误触发人数正则
+                        const hay3 = (String(frames[i] || '') + ' ' + oneArgs.positive).toLowerCase().replace(/story scene \d+ of \d+/g, ' ');
+                        solo3 = !/(man\b.*woman\b|woman\b.*man\b|\btwo\b|\b\d+\s*(men|women|people|persons|girls|boys|figures)\b|both |couple|pair|一对|两人|双人|三人|三个|three |夫妻|情侣|对峙|fight|battle|打斗)/.test(hay3) && /(woman|girl|man|boy|person|少女|女孩|女子|男子|男人|女人)/.test(hay3);
+                        // v7.15 多人帧（two/three/对峙/confrontation 等）同样跳过 img2img：
+                        // 单人参考图会把多人构图带成单人（实测 00402 三人对峙格被 00401 单人黑衣格锁成单人）。
+                        // 多人帧靠正面人数词 + AutoPose 骨架锁人数姿态，参考图锁角色只用于同人数帧。
+                        isMultiRef = /(\btwo\b|\bthree\b|\b\d+\s*(men|women|people|persons|girls|boys|figures)\b|对峙|三人|三人|多人|打斗|fight|battle|confrontation|standoff|stand-off|couple|pair|一群|crowd|围攻|围拢|facing each other)/.test(hay3);
+                    } catch (e) { /* 忽略 */ }
+                    if (!solo3 && !isMultiRef) {
+                        oneArgs.image = genderRefMap[genderTag];
+                        oneArgs.img2img_denoise = settings.comic_char_lock_denoise !== undefined ? settings.comic_char_lock_denoise : 0.55;
+                        oneArgs.positive = oneArgs.positive + ', same person as the reference image, identical face, identical gender, identical hairstyle, identical outfit';
+                    }
                 }
             } else {
                 // 普通多张：每张换 seed 出不同构图即可（generateOneImage 内部已随机 seed）
@@ -1184,7 +1255,15 @@
                 const gridUrl = await comicGridCompose(slice.map((im) => im.url));
                 if (gridUrl) {
                     outImages.push({ url: gridUrl, name: 'comic_grid_p' + (p + 1), is_grid: true });
-                    pageBlocks.push('![image](' + gridUrl + ')\n\n[第' + (p + 1) + '页 各格分镜]\n' + slice.map(captionMd).join('\n\n'));
+                    // v7.12 拼页模式下 markdown 只放"拼页图 + 中文配文行"，不再贴各格单图。
+                    // 原因：此前每页同时贴拼页图+4张单格图（4页=20张图），返回文本过长，
+                    // DeepSeek 回复时截断/省略，用户只看到第一张（实测"多张只返一张"）。
+                    // 各格单图仍完整保留在 images 字段里，需要时仍可取。
+                    const caps = slice.map((im, idx) => {
+                        const cap = im && im.caption;
+                        return (cap ? '格' + (idx + 1) + '：' + cap : '格' + (idx + 1));
+                    });
+                    pageBlocks.push('![image](' + gridUrl + ')\n\n[第' + (p + 1) + '页 ' + slice.length + '格]\n' + caps.join('\n'));
                 } else {
                     outImages.push(...slice);
                     pageBlocks.push(slice.map(captionMd).join('\n\n'));
@@ -1344,6 +1423,26 @@
             if (String(summary).startsWith('PASS')) {
                 res.quality_gate = String(summary);
                 res.quality_attempts = attempt;
+                // v7.12 手部/肢体强化修复：PASS 也走一轮局部修复（有检测框时）。
+                // 根因：QualityGate 的手部检测在多人/远景场景常漏检畸形手 → 误判 PASS →
+                // 此前直接交付，用户实测"每张手部都有变形"。PASS 时若 summary 带
+                // hands/arms/boxes 检测框，就按框修复一轮再交付（无框则跳过，不空耗）。
+                if (settings.hands_always_fix !== false && settings.quality_inpaint !== false && res.images && res.images.length) {
+                    try {
+                        const bM = String(summary).match(/boxes=([0-9,;]+)/);
+                        const aM = String(summary).match(/arms=([0-9,;]+)/);
+                        const hM = String(summary).match(/hands=([0-9,;]+)/);
+                        const mM = String(summary).match(/mask=(masks\/[^|]+)/);
+                        const rep = await tryInpaintRepair(res.images[0].url, bM ? bM[1] : null, mM ? mM[1] : null, a, aM ? aM[1] : null, hM ? hM[1] : null);
+                        if (rep && !rep.error && rep.images && rep.images[0] && rep.images[0].url) {
+                            rep.quality_gate = String(summary);
+                            rep.quality_attempts = attempt;
+                            rep.quality_repair = true;
+                            rep.quality_enhance = 'hands_always_fix';
+                            return JSON.stringify(rep);
+                        }
+                    } catch (e) { /* 强化修复失败不影响交付 */ }
+                }
                 return JSON.stringify(res);
             }
             // FAIL：优先尝试局部放大重绘（boxes=脸区、arms=手臂区）；最多修复 3 轮
@@ -1781,6 +1880,8 @@
                 + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
                 + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
                 + '\n[拆格数量·硬性约束] 用户明确说"X页漫画每页Y格"时，frames 长度**必须恰好等于 X×Y**（例："2页漫画每页2格"=4 个 frames、"4页漫画每页4格"=16 个 frames），一个不多一个不少；用户只说"漫画/分镜"没说格数时默认 4 个 frames。每格必须对应剧情里一个**具体真实发生的情节**，禁止自创与剧情无关的画面（例：剧情是主角在物流园搬货，就不许画情侣约会）。frames 拆格不足会被系统打回重写。'
+                + '\n[逐格还原剧情·强制] 每格 frames 的地点、时间、人物、动作、道具必须**从剧情原文提取**，禁止添加剧情里没有的人物/场景/动作/物品，禁止把 A 段剧情的人物画到 B 段场景。'
+                + '\n[多图展示·强制] 工具返回的 markdown 内含全部 N 张图（漫画为每页一张拼页图+各页中文配文）。你的最终回复必须把**每一张图**都按顺序用 ![image](图片URL) 原样贴出，一张都不能漏、不能只贴第一张；图与图之间可以写该页剧情/对白的中文说明。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
                 + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字。最终回复里除图片外，只写简洁中文说明（剧情/对白），禁止任何英文解释。'
@@ -1921,6 +2022,9 @@
               <label class="checkbox_label" for="cd_quality_gate">
                 <input type="checkbox" id="cd_quality_gate"> 质量审查（出图后自动检测畸形，不合格换 seed 重试，推荐开启）
               </label>
+              <label class="checkbox_label" for="cd_hands_always_fix">
+                <input type="checkbox" id="cd_hands_always_fix"> 手部强化修复（质量门通过也对手/脸/臂检测框再修一轮，防畸形手放行，推荐开启）
+              </label>
               <label class="checkbox_label" for="cd_use_sdxl">
                 <input type="checkbox" id="cd_use_sdxl"> SDXL 档（Juggernaut XL + 亚洲脸 LoRA：832×1216 / CFG 4.0 / 22步，推荐开启）
               </label>
@@ -1993,6 +2097,8 @@
         if (injectEl) injectEl.checked = !!settings.inject_prompt;
         const qualityGateEl = document.getElementById('cd_quality_gate');
         if (qualityGateEl) qualityGateEl.checked = !!settings.quality_gate;
+        const handsFixEl = document.getElementById('cd_hands_always_fix');
+        if (handsFixEl) handsFixEl.checked = settings.hands_always_fix !== false;
         const useSdxlEl = document.getElementById('cd_use_sdxl');
         if (useSdxlEl) useSdxlEl.checked = settings.use_sdxl !== false;
         const comicModeEl = document.getElementById('cd_comic_mode');
@@ -2042,6 +2148,12 @@
         if (qualityGateEl) {
             qualityGateEl.addEventListener('change', () => {
                 settings.quality_gate = qualityGateEl.checked;
+                saveSettingsDebounced();
+            });
+        }
+        if (handsFixEl) {
+            handsFixEl.addEventListener('change', () => {
+                settings.hands_always_fix = handsFixEl.checked;
                 saveSettingsDebounced();
             });
         }
