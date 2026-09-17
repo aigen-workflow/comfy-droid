@@ -203,6 +203,11 @@
     let lgImages = [];
     let lgMarkdown = '';
 
+    // ---- v7.11 漫画"页×格"拆格熔断状态 ----
+    // 用户说"2页漫画每页2格"时期望4格；模型可能只拆1个 frames（实测只出1张无关图）。
+    // 首次检测不足 → 返回错误让模型重写（comicRetrySig 记签名，重试仍不足才补格兜底）。
+    let comicRetrySig = '';
+
     // 只把这四个已知函数注册为真实工具，其余函数名忽略
     const SUPPORTED_TOOLS = ['comfy_generate_image', 'llm_generate_full_comfy_workflow', 'comfy_submit_workflow', 'comfy_check_progress'];
 
@@ -1014,6 +1019,39 @@
         // v7.7 修复：frames 场景 count 上限放宽到 16（此前硬限 4 导致 16 格只出前 4 格）
         count = Math.max(1, Math.min(frames.length > 0 ? 16 : 4, count));
 
+        // ---- v7.11 用户"X页漫画每页Y格"期望格数解析 + 拆格熔断 ----
+        // 实测：用户要求"2页漫画每页2格"，DeepSeek 只传 1 个 frames → count=1 → 走单张路径
+        // → 只出 1 张且画面与剧情无关。这里从用户消息解析期望格数，模型拆格不足时：
+        //   首次 → 返回友好错误，让模型按剧情重新拆格（DeepSeek 支持工具错误后重试）；
+        //   重试仍不足 → 补格兜底（复用已有格+场景变体），保证至少出足期望张数。
+        let expectedFromMsg = 0;
+        try {
+            const umText = String(getLastUserMsgText() || '');
+            let mp = umText.match(/(\d+)\s*页漫画每页\s*(\d+)\s*格/);
+            if (!mp) mp = umText.match(/(\d+)\s*页[^\n]{0,20}每页\s*(\d+)\s*格/);
+            if (mp) {
+                expectedFromMsg = Math.min(16, parseInt(mp[1], 10) * parseInt(mp[2], 10));
+            } else {
+                const mc = umText.match(/(\d+)\s*格/);
+                if (mc && /漫画|分镜|连环|画面/.test(umText)) expectedFromMsg = Math.min(16, parseInt(mc[1], 10));
+            }
+        } catch (e) { expectedFromMsg = 0; }
+        if (expectedFromMsg >= 2 && frames.length < expectedFromMsg) {
+            const sig = getLastUserMsgSig();
+            if (comicRetrySig !== sig) {
+                comicRetrySig = sig;
+                return JSON.stringify({
+                    error: '用户要求画成 ' + expectedFromMsg + ' 格漫画，但你只提供了 ' + frames.length + ' 个 frames' + (frames.length === 0 ? '（frames 为空：没有拆格，禁止浓缩成一张）' : '') + '。请把用户整段剧情严格拆成恰好 ' + expectedFromMsg + ' 个 frames（frames 数组长度必须等于 ' + expectedFromMsg + '），每格一个完整英文画面描述：主体(性别/年龄/服装) + 动作 + 场景 + 镜头 + 光线氛围 + 画质词，禁止写无关内容、禁止把剧情浓缩成一句。重写后重新调用 comfy_generate_image。',
+                });
+            }
+            // 重试仍不足：补格兜底，保证至少出 expected 张（复用已有格 + 场景变体）
+            const baseLen = Math.max(1, frames.length);
+            while (frames.length < expectedFromMsg) {
+                frames.push(String(frames[frames.length % baseLen] || '') + ', scene variant, different angle, different moment of the story');
+            }
+            count = frames.length;
+        }
+
         // v7.0 三视图模式强制 3 张（正面/侧面/背面）
         const viewMode = /front|side|back|正面|侧面|背面|三视图|设定图/.test(String(a.view || ''))
             || /三视图|设定图|正侧面|正背面|正面照|侧面照|背面照/i.test(String(getLastUserMsgText()));
@@ -1742,6 +1780,7 @@
                 + '\n【角色锁定·第1格是关键】扩展会自动把第 1 格的画面作为后续所有格的角色参考（锁脸/性别/身材）。因此**第 1 格 frames 必须写清主角完整身份**（性别+年龄+发型+服装+体型，例：a 18yo slim chinese male, short black hair, worn grey t-shirt）；后续每格同样要重复主角身份，禁止主角中途变性/换人。'
                 + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
                 + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
+                + '\n[拆格数量·硬性约束] 用户明确说"X页漫画每页Y格"时，frames 长度**必须恰好等于 X×Y**（例："2页漫画每页2格"=4 个 frames、"4页漫画每页4格"=16 个 frames），一个不多一个不少；用户只说"漫画/分镜"没说格数时默认 4 个 frames。每格必须对应剧情里一个**具体真实发生的情节**，禁止自创与剧情无关的画面（例：剧情是主角在物流园搬货，就不许画情侣约会）。frames 拆格不足会被系统打回重写。'
                 + (hasCharConst ? '\n[角色常量已锁定] 角色外貌（脸/发型/服装/身材）由常量块锁定：' + settings.character_constants + '。每格画面描述只写该格的场景/动作/表情/镜头，**禁止**在 frames 里重写或增删角色外貌描述（常量块会自动拼到每格前面）。' : '')
                 + (hasCharRef ? '\n[角色参考图已锁定] 必须把 ' + settings.character_ref + ' 传给 image 参数（图生图），全程锁脸锁身材；若你（模型）看不到该 URL，直接调用工具，扩展会自动使用角色图。' : '')
                 + '\n各格之间保持同一角色、同一画风（photorealistic cinematic）、同一光线氛围，剧情按顺序连贯推进。禁止四格黑白漫画风、禁止气泡/对话框/图内文字。最终回复里除图片外，只写简洁中文说明（剧情/对白），禁止任何英文解释。'
