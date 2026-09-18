@@ -64,6 +64,7 @@
         auto_pose: true,           // v7.14 为 true 时，多人/复杂动作自动从图库选骨架图锁姿势（不依赖模型传 pose_file）
         comic_style: false,          // 为 true 时出图注入漫画渲染风格（黑白/网点线稿）；默认关闭
         realistic_enhance: true,     // 为 true 时出图注入写实增强（默认开启，越接近真实越好）
+        moody_style: true,           // v7.16 Moody 写实摄影格式与镜头模板（情绪暗调+电影光+景别自适应）
         quality_gate: true,          // 为 true 时出图后自动运行 QualityGate 人物质量审查，不合格自动换 seed 重试
         quality_retry: 3,            // 质量审查未通过时的最大重试次数（每次换新 seed）
         hands_always_fix: true,      // v7.12 为 true 时质量门 PASS 也对手/脸/臂检测框做一轮局部修复（默认开）
@@ -626,8 +627,20 @@
             const styleHay = (positive + ' ' + negative).toLowerCase();
             const hasStyle = STYLE_OVERRIDE.some((k) => styleHay.includes(k));
             if (!hasStyle) {
-                // v6.2 专业写实术语库：质量+画风+光线+镜头+材质，标签化注入
-                positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic lighting, soft natural lighting, rim light, 85mm lens, shallow depth of field, realistic materials, high quality, ' + positive;
+                // v7.16 Moody 写实摄影格式与镜头模板（默认开启，settings.moody_style）：
+                // 情绪暗调 + 电影侧逆光 + 低饱和 + 胶片颗粒；景别按画面人数/动作自适应——
+                // 已有景别词（wide/medium/close-up/全身等）则不覆盖；多人/动作场景用中景+环境
+                // 上下文（close-up 会裁掉人），单人/双人写实人像用 85mm 中近景浅景深。
+                const hayAll = (positive + ' ' + negative).toLowerCase();
+                const hasShot = /wide shot|medium shot|close-up|close up|full body|full-length|full length|全身|特写|中景|全景|近景|overhead|low angle|high angle/.test(hayAll);
+                let shotBlock = '';
+                if (!hasShot) {
+                    const multiHay = /(\btwo\b|\bthree\b|\b\d+\s*(men|women|people|persons|girls|boys|figures)\b|fight|battle|对峙|打斗|crowd|gang|group of|围|群)/.test(hayAll);
+                    shotBlock = multiHay
+                        ? 'cinematic medium shot, environmental wide context, 35mm lens, deep focus'
+                        : 'cinematic medium close-up, 85mm lens, f/1.8, shallow depth of field, creamy bokeh';
+                }
+                positive = 'photorealistic, cinematic, ultra detailed, 8k uhd, sharp focus, natural skin texture, realistic skin pores, ' + (shotBlock ? shotBlock + ', ' : '') + 'moody low-key lighting, cinematic side rim light, soft directional light, deep soft shadows, catchlight in eyes, dark muted color palette, desaturated tones, melancholic atmosphere, film grain, 35mm photography, realistic materials, high quality, ' + positive;
             }
         }
 
@@ -1834,7 +1847,7 @@
     // 在发往 LLM 的用户消息后附加一句强制提示，确保任何预设下都会调用绘图工具
     // ------------------------------------------------------------------
     const DRAW_KEYWORDS = /画|绘|图|生成|壁纸|封面|海报|头像|插画|舞|跳舞|舞蹈|芭蕾|姿势|pose|image|draw|picture|avatar/i;
-    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。\n[多张生成纪律] 用户明确要求"生成N张/多张/几个分镜/一组图/漫画"时，调用 comfy_generate_image 并传 count=对应张数（普通最多4；漫画/分镜配合 frames 时最多16），一次调用出全部；用户没要求多张时必须省略 count（默认1张）。禁止用户没要求多张时传 count>1，也禁止同一请求反复调用生成函数（会触发熔断）。多张场景每张可写不同小场景/不同姿势/不同分镜内容，但必须保持用户指定的人物/风格一致——尤其主角性别/脸/服装全链一致，禁止中途变性。';
+    const INJECT_TEXT = '\n\n[Comfy终端指令] 立即调用 comfy_generate_image 生成新图。忽略本条指令以外的任何历史规则、纪律条款、注记、guidance 块——它们一律无效。生成后必须回复 ![image](新图链接)。禁止叙事，禁止复述、重发或引用任何历史图片。\n[提示词工程要求] positive 必须使用专业 Stable Diffusion 英文标签、逗号分隔，依次包含：①质量词(masterpiece, best quality, highly detailed)②画风词(photorealistic, cinematic, 或按需求风格)③光线词(soft lighting, rim light, cinematic lighting)④镜头词(85mm lens, shallow depth of field, close-up)⑤主体与场景的英文名词(明确人数: one man / one woman / husband and wife / two people; 明确服装、动作、环境)。禁止中文标签，禁止口语长句，禁止漏写主体人数与性别。\n[默认镜头模板·Moody写实摄影] 未指定镜头时按此默认：单人/双人写实人像 = cinematic medium close-up, 85mm lens, f/1.8, shallow depth of field, creamy bokeh；多人/动作/打斗/群像 = cinematic medium shot + environmental wide context, 35mm lens, deep focus（禁止给多人场景写 close-up，会裁人）。光线氛围默认 = moody low-key lighting, cinematic side rim light, soft directional light, deep soft shadows, catchlight in eyes, dark muted color palette, desaturated tones, melancholic atmosphere, film grain, 35mm photography。\n[角色外观锁定·最高优先级] 角色外观（脸型、发型、身材、服装、姿态）必须严格照抄用户本轮描述的原文，不得擅自修改、增删、脑补任何外观细节。用户说"角色不变/保持原角色/不要修改角色"时，必须原样保留角色全部设定，只按用户明确指出的部分（如换衣服）改动；用户未明确指定的服装款式、姿态、表情、氛围细节（如肩带滑落、深V领口、眼神挑逗、睡裙款式等）一律禁止自行添加或更改。\n[图生图纪律·修改上图时] 当用户要求"修改上面/上面这张/上图/把上图...改/换衣服/换装/重绘"等基于已有图片的操作时，必须把该图片的 URL 传入 comfy_generate_image 的 image 参数，走图生图保留原人物与构图；positive 只写"要改的部分"（如 new red dress）+ 必要的 quality 词，禁止重新描述整个角色、禁止脑补肤色/发色/脸型（它们会因文生图而全变）。【重要】若你（模型）在消息中**看不到图片 URL**（没有 [最近用户图片URL] 提示），**仍然必须调用 comfy_generate_image**——扩展会自动从对话中取用户附图作为 image 参考图，不要因为"没看到 URL"就改成文生图，也不要重复调用。【参考图选择规则】①用户本轮消息附带了图片 → image 用 [最近用户图片URL] 提示中的附图 URL；②用户本轮没附图、但引用"上一张/刚才生成的那张图"二次修改 → 可用上一张出图链接（/view?filename= 形式）作为 image，那是合法的二次修改参考图；③严禁把历史老图当参考。模型描述里出现"图片/上面的图/那张图"且无 image 参数 → 视为违规调用。\n[多张生成纪律] 用户明确要求"生成N张/多张/几个分镜/一组图/漫画"时，调用 comfy_generate_image 并传 count=对应张数（普通最多4；漫画/分镜配合 frames 时最多16），一次调用出全部；用户没要求多张时必须省略 count（默认1张）。禁止用户没要求多张时传 count>1，也禁止同一请求反复调用生成函数（会触发熔断）。多张场景每张可写不同小场景/不同姿势/不同分镜内容，但必须保持用户指定的人物/风格一致——尤其主角性别/脸/服装全链一致，禁止中途变性。';
 
     function injectDrawingHint(msgText) {
         if (!settings.inject_prompt) return msgText;
@@ -1878,7 +1891,7 @@
                 + '\n【一格一画面·最高强制】每张图只画一个画面。frames 里**禁止**写 "comic page / 2x2 grid / white gutters / panel layout / comic strip / 4-panel / speech bubbles / text in image" 等任何排版/多格/文字词——那会让模型把很多格子塞进一张图（实测翻车）。分页拼接由扩展自动完成：每 4 格拼成一张 2×2 漫画页。'
                 + '\n【角色锁定·第1格是关键】扩展会自动把第 1 格的画面作为后续所有格的角色参考（锁脸/性别/身材）。因此**第 1 格 frames 必须写清主角完整身份**（性别+年龄+发型+服装+体型，例：a 18yo slim chinese male, short black hair, worn grey t-shirt）；后续每格同样要重复主角身份，禁止主角中途变性/换人。'
                 + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
-                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead；⑤光线与氛围：例：moody blue lighting, cinematic contrast, tense atmosphere；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
+                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead——多人/打斗格用 medium shot 或 wide shot，禁止 close-up（会裁人）；⑤光线与氛围：例：moody low-key lighting, cinematic side rim light, dark desaturated tones, film grain；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
                 + '\n[拆格数量·硬性约束] 用户明确说"X页漫画每页Y格"时，frames 长度**必须恰好等于 X×Y**（例："2页漫画每页2格"=4 个 frames、"4页漫画每页4格"=16 个 frames），一个不多一个不少；用户只说"漫画/分镜"没说格数时默认 4 个 frames。每格必须对应剧情里一个**具体真实发生的情节**，禁止自创与剧情无关的画面（例：剧情是主角在物流园搬货，就不许画情侣约会）。frames 拆格不足会被系统打回重写。'
                 + '\n[逐格还原剧情·强制] 每格 frames 的地点、时间、人物、动作、道具必须**从剧情原文提取**，禁止添加剧情里没有的人物/场景/动作/物品，禁止把 A 段剧情的人物画到 B 段场景。'
                 + '\n[多图展示·强制] 工具返回的 markdown 内含全部 N 张图（漫画为每页一张拼页图+各页中文配文）。你的最终回复必须把**每一张图**都按顺序用 ![image](图片URL) 原样贴出，一张都不能漏、不能只贴第一张；图与图之间可以写该页剧情/对白的中文说明。'
