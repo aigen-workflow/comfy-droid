@@ -801,6 +801,15 @@
             workflow['9'].inputs.images = ['8d', 0];
         }
 
+        // v7.17 漫画拼页提速：加 PreviewImage 小图输出（temp，约几十KB）。
+        // 手机端拼页 fetch 优先用 previewUrl（小图），不再走隧道下载 1.5MB 原图——
+        // 原图 16 张 24MB 经 cpolar 免费隧道 8s 必然超时，拼页失败→回退贴16张单图→
+        // markdown 超长→DeepSeek 截断→不返图/只返一张（用户实测"无法返图"）。
+        workflow['9p'] = {
+            class_type: 'PreviewImage',
+            inputs: { images: workflow['9'].inputs.images },
+        };
+
         // 姿势锁定：从图库加载姿势图 → OpenPose 提取骨骼 → ControlNet 锁姿势
         if (settings.pose_enabled && poseFileFinal) {
             workflow['20'] = {
@@ -933,21 +942,31 @@
             // 任务已完成：收集图片
             const outputs = entry.outputs || {};
             const images = [];
+            // v7.17 区分主图（type=output，SaveImage）与预览小图（type=temp，PreviewImage）：
+            // 预览图用于手机端漫画拼页（小图快），主图用于最终展示。按收集顺序配对——
+            // 当前工作流只有 SaveImage(先) + PreviewImage(后) 两个图节点，二者输出顺序一一对应。
+            const mainImages = [];
+            const previewImages = [];
             for (const nodeId of Object.keys(outputs)) {
                 const out = outputs[nodeId];
                 if (!out || !Array.isArray(out.images)) continue;
                 for (const img of out.images) {
-                    const url = base + '/view?filename=' + encodeURIComponent(img.filename)
-                        + '&subfolder=' + encodeURIComponent(img.subfolder || '')
-                        + '&type=' + encodeURIComponent(img.type || 'output');
-                    images.push({
+                    const isPreview = String(img.type || '') === 'temp' || String(img.subfolder || '') === 'temp';
+                    const target = isPreview ? previewImages : mainImages;
+                    target.push({
                         filename: img.filename,
                         subfolder: img.subfolder || '',
                         type: img.type || 'output',
-                        url: url,
+                        url: base + '/view?filename=' + encodeURIComponent(img.filename)
+                            + '&subfolder=' + encodeURIComponent(img.subfolder || '')
+                            + '&type=' + encodeURIComponent(img.type || 'output'),
                     });
                 }
             }
+            for (let i = 0; i < mainImages.length; i++) {
+                if (previewImages[i]) mainImages[i].previewUrl = previewImages[i].url;
+            }
+            images.push(...mainImages);
 
             if (images.length === 0) {
                 return JSON.stringify({ status: 'done', prompt_id: pid, images: [], message: '任务完成，但没有图片输出' });
@@ -1050,8 +1069,13 @@
             return JSON.stringify({ error: '未配置 checkpoint 模型名，请在扩展设置中填写' });
         }
         const positive = a.positive || '';
-        if (!String(positive).trim()) {
+        // v7.17 frames 分镜模式允许不传 positive（每格用 frames[i]，首格兜底）
+        const hasFrames = Array.isArray(a.frames) && a.frames.some((f) => String(f).trim().length > 0);
+        if (!String(positive).trim() && !hasFrames) {
             return JSON.stringify({ error: '缺少正向提示词 positive' });
+        }
+        if (!String(positive).trim() && hasFrames) {
+            a.positive = String(a.frames[0] || '').trim();
         }
 
         // ---- v6.7 消息签名级熔断（外层判定一次）----
@@ -1265,7 +1289,7 @@
             const pageBlocks = [];
             for (let p = 0; p < pageCount; p++) {
                 const slice = allImages.slice(p * pageSize, p * pageSize + pageSize);
-                const gridUrl = await comicGridCompose(slice.map((im) => im.url));
+                const gridUrl = await comicGridCompose(slice);
                 if (gridUrl) {
                     outImages.push({ url: gridUrl, name: 'comic_grid_p' + (p + 1), is_grid: true });
                     // v7.12 拼页模式下 markdown 只放"拼页图 + 中文配文行"，不再贴各格单图。
@@ -1278,8 +1302,15 @@
                     });
                     pageBlocks.push('![image](' + gridUrl + ')\n\n[第' + (p + 1) + '页 ' + slice.length + '格]\n' + caps.join('\n'));
                 } else {
-                    outImages.push(...slice);
-                    pageBlocks.push(slice.map(captionMd).join('\n\n'));
+                    // v7.17 拼页失败降级：每页只贴第 1 格图 + 4 行配文（不再贴 4 张单格图，
+                    // 4 页=16 张会再次超长截断导致不返图）。原图仍全部保留在 images 字段。
+                    outImages.push(slice[0]);
+                    pageBlocks.push((slice[0] && slice[0].url ? '![image](' + slice[0].url + ')' : '')
+                        + '\n\n[第' + (p + 1) + '页 ' + slice.length + '格·拼页失败，已展示首格]\n'
+                        + slice.map((im, idx) => {
+                            const cap = im && im.caption;
+                            return (cap ? '格' + (idx + 1) + '：' + cap : '格' + (idx + 1));
+                        }).join('\n'));
                 }
             }
             markdown = pageBlocks.join('\n\n');
@@ -1302,10 +1333,14 @@
     // 依赖 Comfy 启动参数 --enable-cors-header "*"（已配置），WebView 内可 fetch 各格图。
     // v7.4 修复：所有 fetch 加 AbortController 超时（cpolar 域名一变旧地址会无限挂起导致整次生成卡死），
     // 任一步失败/超时直接返回 '' 跳过拼页，绝不阻塞出图。
-    async function comicGridCompose(urls) {
-        const deadline = Date.now() + 20000; // 拼页整体 20s 上限
+    // v7.17 提速+兼容：优先 fetch previewUrl（PreviewImage 小图，几十KB，不再拉 1.5MB 原图）；
+    // 超时放宽（小图 15s/整体 45s）；createImageBitmap 不可用的旧 WebView 降级用 Image 元素；
+    // 格图 contain 等比居中缩放（不再拉伸变形）。
+    async function comicGridCompose(ims) {
+        const deadline = Date.now() + 45000; // 拼页整体 45s 上限
         try {
-            if (!Array.isArray(urls) || urls.length < 2) return '';
+            if (!Array.isArray(ims) || ims.length < 2) return '';
+            const urls = ims.map((im) => (im && (im.previewUrl || im.url)) || im);
             const n = Math.min(urls.length, 4);
             const cols = 2;
             const rows = Math.ceil(n / 2);
@@ -1321,12 +1356,26 @@
                 if (Date.now() > deadline) break;
                 try {
                     const ctl = new AbortController();
-                    const to = setTimeout(() => ctl.abort(), 8000);
+                    const to = setTimeout(() => ctl.abort(), 15000);
                     const r = await fetch(urls[i], { signal: ctl.signal });
                     clearTimeout(to);
                     if (!r.ok) continue;
-                    const bmp = await createImageBitmap(await r.blob());
-                    loaded.push(bmp);
+                    const blob = await r.blob();
+                    let bmp = null;
+                    if (typeof createImageBitmap === 'function') {
+                        try { bmp = await createImageBitmap(blob); } catch (e) { bmp = null; }
+                    }
+                    if (!bmp) {
+                        // 旧 WebView 无 createImageBitmap：降级用 Image 元素解码
+                        bmp = await new Promise((resolve) => {
+                            const url = URL.createObjectURL(blob);
+                            const img = new Image();
+                            img.onload = () => resolve(img);
+                            img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+                            img.src = url;
+                        });
+                    }
+                    if (bmp) loaded.push(bmp);
                 } catch (e) { /* 单格失败/超时跳过 */ }
             }
             if (!loaded.length) return '';
@@ -1334,7 +1383,14 @@
                 const col = i % cols, row = Math.floor(i / cols);
                 const dx = pad + col * (cellW + gap);
                 const dy = pad + row * (cellH + gap);
-                ctx.drawImage(loaded[i], dx, dy, cellW, cellH);
+                // contain 等比居中：保持格图比例，避免 952x1392 被拉伸变形
+                const iw = loaded[i].width || 0, ih = loaded[i].height || 0;
+                let dw = cellW, dh = cellH;
+                if (iw > 0 && ih > 0) {
+                    const scale = Math.min(cellW / iw, cellH / ih);
+                    dw = Math.round(iw * scale); dh = Math.round(ih * scale);
+                }
+                ctx.drawImage(loaded[i], dx + (cellW - dw) / 2, dy + (cellH - dh) / 2, dw, dh);
             }
             const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
             if (!blob) return '';
@@ -1344,7 +1400,7 @@
             fd.append('image', blob, 'comic_grid_' + Date.now() + '.png');
             fd.append('type', 'input');
             const upCtl = new AbortController();
-            const upTo = setTimeout(() => upCtl.abort(), 10000);
+            const upTo = setTimeout(() => upCtl.abort(), 15000);
             const up = await fetch(base0 + '/upload/image', { method: 'POST', body: fd, signal: upCtl.signal });
             clearTimeout(upTo);
             const upj = await up.json();
@@ -1891,7 +1947,7 @@
                 + '\n【一格一画面·最高强制】每张图只画一个画面。frames 里**禁止**写 "comic page / 2x2 grid / white gutters / panel layout / comic strip / 4-panel / speech bubbles / text in image" 等任何排版/多格/文字词——那会让模型把很多格子塞进一张图（实测翻车）。分页拼接由扩展自动完成：每 4 格拼成一张 2×2 漫画页。'
                 + '\n【角色锁定·第1格是关键】扩展会自动把第 1 格的画面作为后续所有格的角色参考（锁脸/性别/身材）。因此**第 1 格 frames 必须写清主角完整身份**（性别+年龄+发型+服装+体型，例：a 18yo slim chinese male, short black hair, worn grey t-shirt）；后续每格同样要重复主角身份，禁止主角中途变性/换人。'
                 + '\n禁止把整段剧情写成一句话塞进 frames（那会导致所有格画成同一张图）；禁止 frames 用中文（生图必须英文提示词）；禁止 captions 用英文（配文必须中文）。'
-                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat）；②动作：正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead——多人/打斗格用 medium shot 或 wide shot，禁止 close-up（会裁人）；⑤光线与氛围：例：moody low-key lighting, cinematic side rim light, dark desaturated tones, film grain；⑥画质词：photorealistic, cinematic, highly detailed, 8k。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
+                + '\n[分镜写作模板·必须遵守] frames 里每一格必须严格按下面要素逐项写全（英文标签、逗号分隔）：①主体人物：**该格画面中实际出现的每一个人物**的身份/性别/年龄/服装/身材（例：a 30yo chinese man in black trench coat, a 28yo chinese woman in white dress）——剧情里有几个人就写几个人，**禁止省略人物、禁止把双人/多人场景缩成单人**；②动作：每个人正在做什么（例：running through rain, chasing a shadow）；③场景：地点+时间+天气（例：night city street, neon lights, heavy rain）；④镜头：wide shot / medium shot / close-up / low angle / overhead——多人/打斗格用 medium shot 或 wide shot，禁止 close-up（会裁人）；⑤光线与氛围：例：moody low-key lighting, cinematic side rim light, dark desaturated tones, film grain；⑥画质词：photorealistic, cinematic, highly detailed, 8k。**相邻两格的场景与动作必须明显不同**（禁止连续两格都是同一人坐在同一房间发呆——那是重复画面，用户会判定"大量重复"）；**剧情明确出现的角色（如浴室里的女性角色）必须在该格画面中真实出现并写明她的动作**，禁止回避省略。禁止漏写①③④，禁止口语化长句，禁止中文，禁止任何多格/排版/文字相关词汇。'
                 + '\n[拆格数量·硬性约束] 用户明确说"X页漫画每页Y格"时，frames 长度**必须恰好等于 X×Y**（例："2页漫画每页2格"=4 个 frames、"4页漫画每页4格"=16 个 frames），一个不多一个不少；用户只说"漫画/分镜"没说格数时默认 4 个 frames。每格必须对应剧情里一个**具体真实发生的情节**，禁止自创与剧情无关的画面（例：剧情是主角在物流园搬货，就不许画情侣约会）。frames 拆格不足会被系统打回重写。'
                 + '\n[逐格还原剧情·强制] 每格 frames 的地点、时间、人物、动作、道具必须**从剧情原文提取**，禁止添加剧情里没有的人物/场景/动作/物品，禁止把 A 段剧情的人物画到 B 段场景。'
                 + '\n[多图展示·强制] 工具返回的 markdown 内含全部 N 张图（漫画为每页一张拼页图+各页中文配文）。你的最终回复必须把**每一张图**都按顺序用 ![image](图片URL) 原样贴出，一张都不能漏、不能只贴第一张；图与图之间可以写该页剧情/对白的中文说明。'
